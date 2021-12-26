@@ -30,3 +30,14 @@ resources/
 *.pt
 /csn/
 .vscode
+*.parquet
+*.csv
+tags
+*.jsonl
+/current
+/checkpoints
+/ref
+*.bin
+*.npy
+*.log
+/old_checkpoints

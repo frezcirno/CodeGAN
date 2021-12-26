@@ -187,8 +187,8 @@ class Seq2Seq(nn.Module):
         self, code_bat: Tensor, doc_bat: Tensor, teacher_forcing_ratio: float = 0.5
     ) -> Tensor:
 
-        #src = [src sent len, batch size]
-        #trg = [trg sent len, batch size]
+        # src = [src sent len, batch size]
+        # trg = [trg sent len, batch size]
         batch_size = code_bat.shape[1]
         max_len = doc_bat.shape[0]
         trg_vocab_size = self.decoder.output_dim
@@ -210,9 +210,6 @@ class Seq2Seq(nn.Module):
         return outputs
 
 
-# %%
-
-
 def init_weights(m: nn.Module):
     for name, param in m.named_parameters():
         if "weight" in name:
@@ -223,3 +220,23 @@ def init_weights(m: nn.Module):
 
 def count_parameters(model: nn.Module):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+NB_FEATURES = len(code_vocab)
+OUTPUT_DIM = len(doc_vocab)
+
+ENC_EMB_DIM = 32
+DEC_EMB_DIM = 32
+ENC_HID_DIM = 64
+DEC_HID_DIM = 64
+ATTN_DIM = 8
+ENC_DROPOUT = 0.5
+DEC_DROPOUT = 0.5
+
+enc = Encoder(NB_FEATURES, ENC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, ENC_DROPOUT)
+
+attn = Attention(ENC_HID_DIM, DEC_HID_DIM, ATTN_DIM)
+
+dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, DEC_DROPOUT, attn)
+
+model = Seq2Seq(enc, dec, device)
