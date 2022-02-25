@@ -3,6 +3,7 @@ import logging
 import argparse
 from os.path import join as path_join
 import sys
+import itertools
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -128,6 +129,7 @@ args = parser.parse_args(
         "--dis_load_path",
         "checkpoints/2.19/dis/dis_bestppl_1_0.473262.bin",
         "--do_gan_train",
+        "--do_gan_eval",
         "--gan_batch_size",
         "2",
         "--gan_train_epochs",
@@ -178,7 +180,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logging.info(sys.argv)
+logging.info(" ".join(sys.argv))
 logging.info(str(args))
 
 if args.local_rank != -1:
@@ -700,7 +702,7 @@ for epoch in range(args.dis_train_epochs if args.do_dis_train else 0):
                 break
 
 # %%
-if args.do_gan_train:
+if args.do_gan_train or args.do_gan_eval:
     logging.info("Do GAN train:")
 
     logging.info("+ train sample = %d", len(train_dataset))
@@ -776,151 +778,149 @@ if args.do_gan_train:
     logging.info("+ gan_output_file = %s", gan_output_file)
     logging.info("+ gan_gold_file = %s", gan_gold_file)
 
+    best_bleu = 0
+    best_loss = 1e6
+
+    train_iter = iter(itertools.cycle(gan_train_dataloader))
+    valid_iter = iter(itertools.cycle(gan_valid_dataloader))
+
 for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
+
     ## G-step
     g_step_bar = trange(args.gan_g_steps)
     g_step = iter(g_step_bar)
     g_running = True
     while g_running:
-        for batch in gan_train_dataloader:
-            source_ids = batch[0].to(gen_device)
-            source_mask = batch[1].to(gen_device)
+        batch = next(train_iter)
+
+        source_ids = batch[0].to(gen_device)
+        source_mask = batch[1].to(gen_device)
+
+        context, memory_key_padding_mask = _gen.get_context(source_ids, source_mask)
+        # [batch_size x source_length x hidden_size]
+
+        gen.train()
+        pre_target_ids, _ = gen(context, memory_key_padding_mask)
+        pre_target_ids, pre_target_mask = get_target_mask(
+            pre_target_ids, bos_token_id, eos_token_id, pad_token_id,
+        )
+        rewards = rollout.get_reward(
+            source_ids,
+            context,
+            memory_key_padding_mask,
+            pre_target_ids,
+            pre_target_mask,
+            rollnum=args.gan_rollnum,
+        )
+        loss = gen(context, memory_key_padding_mask, pre_target_ids, rewards=rewards)
+
+        if loss.size():
+            loss = loss.mean()
+
+        g_step_bar.set_description(f"EP {epoch} g-step loss {loss.item():.2f}")
+
+        loss.backward()
+        g_optimizer.step()
+        g_optimizer.zero_grad()
+        gan_gen_scheduler.step()
+
+        if args.gan_teach:
+            ## teacher forcing
+            target_ids = batch[2].to(gen_device)
+            target_mask = batch[3].to(gen_device)
 
             context, memory_key_padding_mask = _gen.get_context(source_ids, source_mask)
             # [batch_size x source_length x hidden_size]
 
             gen.train()
-            pre_target_ids, _ = gen(context, memory_key_padding_mask)
-            pre_target_ids, pre_target_mask = get_target_mask(
-                pre_target_ids, bos_token_id, eos_token_id, pad_token_id,
-            )
-            rewards = rollout.get_reward(
-                source_ids,
-                context,
-                memory_key_padding_mask,
-                pre_target_ids,
-                pre_target_mask,
-                rollnum=args.gan_rollnum,
-            )
-            loss = gen(
-                context, memory_key_padding_mask, pre_target_ids, rewards=rewards
+            rewards = torch.ones_like(target_ids) * target_mask  # right answer!
+            tloss = gen(context, memory_key_padding_mask, target_ids, rewards=rewards)
+
+            if tloss.size():
+                tloss = tloss.mean()
+
+            g_step_bar.set_description(
+                f"EP {epoch} g-step {loss.item():.2f} {tloss.item():.2f}"
             )
 
-            if loss.size():
-                loss = loss.mean()
-
-            g_step_bar.set_description(f"EP {epoch} g-step loss {loss.item():.2f}")
-
-            loss.backward()
+            tloss.backward()
             g_optimizer.step()
             g_optimizer.zero_grad()
             gan_gen_scheduler.step()
 
-            if args.gan_teach:
-                ## teacher forcing
-                target_ids = batch[2].to(gen_device)
-                target_mask = batch[3].to(gen_device)
-
-                context, memory_key_padding_mask = _gen.get_context(
-                    source_ids, source_mask
-                )
-                # [batch_size x source_length x hidden_size]
-
-                gen.train()
-                rewards = torch.ones_like(target_ids) * target_mask  # right answer!
-                tloss = gen(
-                    context, memory_key_padding_mask, target_ids, rewards=rewards
-                )
-
-                if tloss.size():
-                    tloss = tloss.mean()
-
-                g_step_bar.set_description(
-                    f"EP {epoch} g-step {loss.item():.2f} {tloss.item():.2f}"
-                )
-
-                tloss.backward()
-                g_optimizer.step()
-                g_optimizer.zero_grad()
-                gan_gen_scheduler.step()
-
-            try:
-                next(g_step)
-            except StopIteration:
-                g_running = False
-                break
+        try:
+            next(g_step)
+        except StopIteration:
+            g_running = False
+            break
 
     ## D-step
     d_step_bar = trange(args.gan_d_steps)
     d_step = iter(d_step_bar)
     d_running = True
     while d_running:
-        for batch in gan_valid_dataloader:
-            source_ids = batch[0].to(dis_device)
-            source_mask = batch[1].to(dis_device)
-            target_ids = batch[2].to(dis_device)
+        batch = next(valid_iter)
 
-            dis.train()
-            pred = dis(source_ids, target_ids)
-            loss1 = F.binary_cross_entropy(
-                pred, torch.ones(source_ids.size(0)).to(dis_device)
-            )
-            if loss1.size():
-                loss1 = loss1.mean()  # mean() to average on multi-gpu
+        source_ids = batch[0].to(dis_device)
+        source_mask = batch[1].to(dis_device)
+        target_ids = batch[2].to(dis_device)
 
-            gen.eval()
-            with torch.no_grad():
-                # context, memory_key_padding_mask = _gen.get_context(
-                #     source_ids.to(gen_device), source_mask.to(gen_device)
-                # )
-                # # [batch_size x source_length x hidden_size]
+        dis.train()
+        pred = dis(source_ids, target_ids)
+        loss1 = F.binary_cross_entropy(
+            pred, torch.ones(source_ids.size(0)).to(dis_device)
+        )
+        if loss1.size():
+            loss1 = loss1.mean()  # mean() to average on multi-gpu
 
-                # g_target_ids, _ = gen(context, memory_key_padding_mask)
+        gen.eval()
+        with torch.no_grad():
+            # context, memory_key_padding_mask = _gen.get_context(
+            #     source_ids.to(gen_device), source_mask.to(gen_device)
+            # )
+            # # [batch_size x source_length x hidden_size]
 
-                # g_target_ids, _ = get_target_mask(
-                #     g_target_ids, bos_token_id, eos_token_id, pad_token_id,
-                # )
-                g_target_ids = _gen.beam_predict(
-                    source_ids.to(gen_device), source_mask.to(gen_device)
-                ).to(dis_device)
+            # g_target_ids, _ = gen(context, memory_key_padding_mask)
 
-            pred = dis(source_ids, g_target_ids)
-            loss2 = F.binary_cross_entropy(
-                pred, torch.zeros(source_ids.size(0)).to(dis_device)
-            )
-            if loss2.size():
-                loss2 = loss2.mean()  # mean() to average on multi-gpu
+            # g_target_ids, _ = get_target_mask(
+            #     g_target_ids, bos_token_id, eos_token_id, pad_token_id,
+            # )
+            g_target_ids = _gen.beam_predict(
+                source_ids.to(gen_device), source_mask.to(gen_device)
+            ).to(dis_device)
 
-            loss = loss1 + loss2
-            loss.backward()
+        pred = dis(source_ids, g_target_ids)
+        loss2 = F.binary_cross_entropy(
+            pred, torch.zeros(source_ids.size(0)).to(dis_device)
+        )
+        if loss2.size():
+            loss2 = loss2.mean()  # mean() to average on multi-gpu
 
-            d_step_bar.set_description(f"EP {epoch} d-step loss {loss.item():.2f}")
+        loss = loss1 + loss2
+        loss.backward()
 
-            d_optimizer.step()
-            d_optimizer.zero_grad()
+        d_step_bar.set_description(f"EP {epoch} d-step loss {loss.item():.2f}")
 
-            try:
-                next(d_step)
-            except StopIteration:
-                d_running = False
-                break
+        d_optimizer.step()
+        d_optimizer.zero_grad()
+
+        try:
+            next(d_step)
+        except StopIteration:
+            d_running = False
+            break
 
     if args.do_gan_eval and standalone_or_master():
         save_model(gen, gan_gen_path)
         save_model(dis, gan_dis_path)
 
         ## Eval G with dev dataset
-        tr_loss = 0
-        nb_tr_examples, nb_tr_steps = 0, 0
-
         logging.info("Do evaluation:")
         logging.info("+ Valid dataset = %d", len(valid_dataset))
 
         gen.eval()
         eval_loss = 0
         tokens_num = 0
-        best_bleu = 0
-        best_loss = 1e6
 
         for batch in tqdm(gan_valid_dataloader, "validation"):
             source_ids = batch[0].to(gen_device)
