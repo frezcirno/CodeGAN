@@ -7,9 +7,11 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.functional import Tensor, F
-from torch.utils.data import TensorDataset
+from torch.utils.data import TensorDataset, ConcatDataset
 from tqdm import tqdm
 from pandas.io.parquet import to_parquet
+
+from model import Discriminator
 
 
 def str_to_ids(inp, tokenizer):
@@ -122,6 +124,53 @@ def cache_call(path, func, format="parquet"):
     return new_func
 
 
+def remember_result(func):
+    def new_func():
+        scope = func
+        if hasattr(scope, "res"):
+            return scope.res
+        scope.res = res = func()
+        return res
+    return new_func
+
+
+def cache_result(path: str, format="parquet"):
+    def pickle_dump(obj, path):
+        with open(path, "wb") as f:
+            cPickle.dump(obj, f)
+
+    def pickle_load(path):
+        with open(path, "rb") as f:
+            return cPickle.load(f)
+
+    FORMAT = {
+        "parquet": (".parquet", to_parquet, pd.read_parquet),
+        "numpy": (".npy", lambda obj, path: np.save(path, obj), np.load),
+        "torch": (".bin", torch.save, torch.load),
+        "pickle": (".pkl", pickle_dump, pickle_load),
+    }
+
+    postfix, saver, loader = FORMAT[format]
+
+    path = str(path)
+    path += postfix
+
+    def decorate(func):
+        def new_func(*args, **kwargs):
+            if os.path.exists(path):
+                return loader(path)
+            res = func(*args, **kwargs)
+            try:
+                if os.path.dirname(path):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                saver(res, path)
+            except Exception as ex:
+                print("cache_result failed:", ex)
+            return res
+        return new_func
+    return decorate
+
+
 def save_model(model, path):
     # Only save the model it-self
     model_to_save = model.module if hasattr(model, "module") else model
@@ -164,7 +213,7 @@ def tensors_to_text(tkzr, pred_ids: Tensor):
 
 
 def train_generator(gen, gen_opt, gen_sch, dataloader, epochs):
-    device = gen.device_ids[0]
+    device = gen.device
 
     tr_loss = 0
     nb_tr_steps = 0
@@ -198,7 +247,7 @@ def train_generator(gen, gen_opt, gen_sch, dataloader, epochs):
 
 
 def train_generator_PG(gen, gen_opt, gen_sch, dis, dataloader, config):
-    device = gen.device_ids[0]
+    device = gen.device
 
     nb_tr_steps = 0
 
@@ -235,7 +284,7 @@ def train_discriminator(dis, dis_opt, dataloader, epochs):
     """
     dataloader: no start/end symbol
     """
-    device = dis.device_ids[0]
+    device = dis.device
 
     tr_loss = 0
     nb_tr_steps = 0
@@ -284,19 +333,21 @@ def make_fake_dataset(_gen, dataloader):
     fake_source_mask = []
     fake_target_ids = []
 
-    device = _gen.device_ids[0]
+    device = _gen.device
 
     _gen.eval()
     with torch.no_grad():
         for batch in tqdm(dataloader, "making fake dataset"):
-            source_ids = batch[0].to(device)
-            source_mask = batch[1].to(device)
+            source_ids = batch[0]
+            source_mask = batch[1]
 
-            g_target_ids = _gen.beam_predict(source_ids, source_mask)
+            g_target_ids = _gen.beam_predict(
+                source_ids.to(device), source_mask.to(device), "cpu"
+            )
 
-            fake_source_ids.append(source_ids.to("cpu"))
-            fake_source_mask.append(source_mask.to("cpu"))
-            fake_target_ids.append(g_target_ids.to("cpu"))
+            fake_source_ids.append(source_ids)
+            fake_source_mask.append(source_mask)
+            fake_target_ids.append(g_target_ids)
 
     fake_source_ids = torch.concat(fake_source_ids)
     fake_source_mask = torch.concat(fake_source_mask)
@@ -305,22 +356,29 @@ def make_fake_dataset(_gen, dataloader):
     return TensorDataset(fake_source_ids, fake_source_mask, fake_target_ids)
 
 
-def mix_dataset(real_dataset, fake_dataset):
+def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
     """
+    Combine two dataset.
+
     Input:
         real_dataset: (source_ids, source_mask, target_ids, target_mask)
         fake_dataset: (source_ids, source_mask, target_ids)
     Output:
         mixed_dataset: (source_ids, source_mask, target_ids, label)
     """
-    fake_datas = list(fake_dataset.tensors[:3]) + [torch.zeros(len(fake_dataset))]
-    real_datas = list(real_dataset.tensors[:3]) + [torch.ones(len(fake_dataset))]
+    real_datas = []
+    fake_datas = []
 
-    all_dataset = (
-        torch.concat([fake_col, real_col])
-        for fake_col, real_col in zip(fake_datas, real_datas)
-    )
-    return TensorDataset(*all_dataset)
+    for col in keep_col:
+        real_datas.append(real_dataset.tensors[col])
+        fake_datas.append(fake_dataset.tensors[col])
+
+    real_datas.append(torch.ones(len(fake_dataset)))
+    fake_datas.append(torch.zeros(len(fake_dataset)))
+
+    real_dataset = TensorDataset(real_datas)
+    fake_dataset = TensorDataset(fake_datas)
+    return ConcatDataset([real_dataset, fake_dataset])
 
 
 class EarlyStopping:

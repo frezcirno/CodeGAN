@@ -47,7 +47,7 @@ class Generator(nn.Module):
         self.bos_id = bos_id
         self.eos_id = eos_id
         self.pad_id = pad_id
-        self.device_ids = [device]
+        self.device = device
 
         # register_buffer() - 模型的常量参数, 不会被训练
         # 类似:
@@ -145,7 +145,8 @@ class Generator(nn.Module):
 
         # Embedding target
         tgt_embeddings = (
-            self.encoder.embeddings(target_ids)  # [...target_ids x hidden_size]
+            # [...target_ids x hidden_size]
+            self.encoder.embeddings(target_ids)
             .permute([1, 0, 2])
             .contiguous()
         )  # [target_length x batch_size x hidden_size]
@@ -153,7 +154,8 @@ class Generator(nn.Module):
         # Decode
         out = self.decoder(
             tgt_embeddings,  # [target_length x batch_size x hidden_size]
-            context.permute([1, 0, 2]),  # [batch_size x source_length x hidden_size]
+            # [batch_size x source_length x hidden_size]
+            context.permute([1, 0, 2]),
             tgt_mask=attn_mask,  # [target_length x target_length]
             memory_key_padding_mask=memory_key_padding_mask,
         )  # [target_length x batch_size x hidden_size]
@@ -183,7 +185,7 @@ class Generator(nn.Module):
         # return loss, loss * active_loss.sum(), active_loss.sum()
         return loss, active_loss.sum(), lm_logits
 
-    def beam_predict(self, source_ids, source_mask):
+    def beam_predict(self, source_ids, source_mask, _device=None):
         """
         Inputs:
             source_ids: [batch_size x source_length]
@@ -197,21 +199,23 @@ class Generator(nn.Module):
 
         preds = []
         batch_size = source_ids.size(0)
+        device = _device if _device else source_ids.device
 
         # Beam search for every sample
         for i in range(batch_size):
             beam = Beam(self.beam_size, self.bos_id, self.eos_id)
             btarget_ids = beam.getCurrentState(source_ids.device)
             # [beam_size x 1]
-            ctx = context[:, i : i + 1].repeat(1, self.beam_size, 1)
+            ctx = context[:, i: i + 1].repeat(1, self.beam_size, 1)
             # [source_length x beam_size x hidden_size]
-            context_mask = source_mask[i : i + 1, :].repeat(self.beam_size, 1)
+            context_mask = source_mask[i: i + 1, :].repeat(self.beam_size, 1)
             memory_key_padding_mask = (1 - context_mask).bool()
             # [beam_size x source_length]
             for _ in range(self.max_length):
                 if beam.done():
                     break
-                attn_mask = self.bias[: btarget_ids.shape[1], : btarget_ids.shape[1]]
+                attn_mask = self.bias[: btarget_ids.shape[1],
+                                      : btarget_ids.shape[1]]
                 tgt_embeddings = (
                     self.encoder.embeddings(btarget_ids)
                     # [beam_size x i x hidden_size]
@@ -237,11 +241,12 @@ class Generator(nn.Module):
                     btarget_ids.data.index_select(0, beam.getCurrentOrigin())
                 )
                 btarget_ids = torch.cat(
-                    (btarget_ids, beam.getCurrentState(btarget_ids.device)), -1
+                    (btarget_ids, beam.getCurrentState(source_ids.device)), -1
                 )
                 # [beam_size x i]
 
-            hyp = beam.getHyp(beam.getFinal())  # [beam_size x [n]] (values: token_id)
+            # [beam_size x [n]] (values: token_id)
+            hyp = beam.getHyp(beam.getFinal())
             # truncate
             beam_preds = beam.buildTargetTokens(hyp)[: self.beam_size]
             # [beam_size x <=max_length]
@@ -249,11 +254,12 @@ class Generator(nn.Module):
             best = beam_preds[0]
             raw = [self.bos_id] + [x.item() for x in best]
             if len(raw) < self.max_length:
-                raw += [self.eos_id] + [self.pad_id] * (self.max_length - len(raw) - 1)
+                raw += [self.eos_id] + [self.pad_id] * \
+                    (self.max_length - len(raw) - 1)
             preds.append(raw)
 
         # [batch_size x max_length] (value: id)
-        return torch.tensor(preds, dtype=torch.int64, device=source_ids.device)
+        return torch.tensor(preds, dtype=torch.int64, device=device)
 
     def predict(self, context, memory_key_padding_mask):
         """
@@ -322,7 +328,8 @@ class Generator(nn.Module):
         #     target_ids = torch.cat([target_ids, padding], 1)
 
         # target_ids: [batch_size x max_length]
-        hiddens = torch.stack(hiddens, dim=1)  # [batch_size x max_length x vocab_size]
+        # [batch_size x max_length x vocab_size]
+        hiddens = torch.stack(hiddens, dim=1)
 
         return target_ids, hiddens
 
@@ -347,7 +354,8 @@ class Generator(nn.Module):
         for _ in range(init_given_num, self.max_length):
             # [batch_size x i]
             tgt_embeddings = (
-                self.encoder.embeddings(target_ids).permute([1, 0, 2]).contiguous()
+                self.encoder.embeddings(target_ids).permute(
+                    [1, 0, 2]).contiguous()
             )  # [i x batch_size x hidden_size]
 
             attn_mask = self.bias[: target_ids.shape[1], : target_ids.shape[1]]
@@ -364,7 +372,7 @@ class Generator(nn.Module):
             out = self.lm_head(out)
             # [batch_size x vocab_size]
 
-            ## here: exp() or log()?
+            # here: exp() or log()?
             pred = torch.multinomial(out.exp(), 1)  # sampling one sample
             # [batch_size ]
 
@@ -395,7 +403,8 @@ class Generator(nn.Module):
 
         out = self.decoder(
             tgt_embeddings,  # [target_length x batch_size x hidden_size]
-            context.permute([1, 0, 2]),  # [source_length x batch_size x hidden_size]
+            # [source_length x batch_size x hidden_size]
+            context.permute([1, 0, 2]),
             tgt_mask=attn_mask,
             memory_key_padding_mask=memory_key_padding_mask,
         )
@@ -486,7 +495,7 @@ class Beam(object):
 
         # bestScoresId is flattened beam x word array, so calculate which
         # word and beam each score came from
-        prevK = torch.div(bestScoresId, numWords, rounding_mode='trunc')
+        prevK = torch.div(bestScoresId, numWords, rounding_mode="trunc")
         self.prevKs.append(prevK)
         self.nextYs.append((bestScoresId - prevK * numWords))
 
@@ -546,8 +555,8 @@ class Rollout:
         self.gen = gen
         self.dis = dis
         self.max_length = max_length
-        self.gen_device = gen.device_ids[0]
-        self.dis_device = dis.device_ids[0]
+        self.gen_device = gen.device
+        self.dis_device = dis.device
 
     def get_reward(
         self,
@@ -592,14 +601,16 @@ class Rollout:
                 )
                 with torch.no_grad():
                     pred = self.dis(
-                        source_ids.to(self.dis_device), target_ids.to(self.dis_device)
+                        source_ids.to(self.dis_device), target_ids.to(
+                            self.dis_device)
                     )
                 # pred = pred.cpu()
                 rewards[init_given_num - 1] += pred
 
             with torch.no_grad():
                 pred = self.dis(
-                    source_ids.to(self.dis_device), pre_target_ids.to(self.dis_device)
+                    source_ids.to(self.dis_device), pre_target_ids.to(
+                        self.dis_device)
                 )
             # pred = pred.cpu()
             # [batch_size]
@@ -614,6 +625,81 @@ class Rollout:
         return rewards
 
 
+def Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, **kwargs):
+    m = nn.Conv2d(in_channels, out_channels,
+                  kernel_size, stride, padding, **kwargs)
+    for name, param in m.named_parameters():
+        if 'weight' in name:
+            # param.data.uniform_(-0.1, 0.1)
+            nn.init.kaiming_uniform_(param.data)
+        elif 'bias' in name:
+            nn.init.constant_(param.data, 0)
+    return m
+
+
+def Linear(in_features, out_features, bias=True):
+    """Weight-normalized Linear layer (input: N x T x C)"""
+    m = nn.Linear(in_features, out_features, bias=bias)
+    nn.init.kaiming_uniform_(m.weight.data)
+    if bias:
+        nn.init.constant_(m.bias.data, 0)
+    return m
+
+
+def Embedding(num_embeddings, embedding_dim, padding_idx):
+    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx)
+    m.weight.data.uniform_(-0.1, 0.1)
+    return m
+
+
+class Highway(nn.Module):
+    def __init__(
+        self,
+        input_size,
+    ):
+        super(Highway, self).__init__()
+
+        self.normal = Linear(input_size, input_size)
+        self.gate = Linear(input_size, input_size)
+
+    def forward(self, x):
+        y = F.relu(self.normal(x))
+        t = torch.sigmoid(self.gate(x))
+
+        return y * t + (1 - t) * x
+
+
+class Conv2dHub(nn.Module):
+    def __init__(self, filter_sizes, filter_nums, hidden_size, max_length):
+        super(Conv2dHub, self).__init__()
+        self.module_list = nn.ModuleList([
+            nn.Sequential(
+                # [bat_siz x chan(1) x max_len x hid_siz]
+                Conv2d(1, filter_num, (filter_size, hidden_size)),
+                # [bat_siz x fil_num x (max_len-fil_siz+1) x 1]
+                nn.BatchNorm2d(filter_num),
+                nn.ReLU(),
+                nn.MaxPool2d((max_length - filter_size + 1, 1)),
+                # [bat_siz x fil_num x 1 x 1]
+            )
+            for filter_size, filter_num in zip(filter_sizes, filter_nums)
+        ])
+
+    def forward(self, i):
+        out = []
+        for conv2d in self.module_list:
+            # [batch_size x chan(1) x source_length x hidden_size]
+            x = conv2d(i).squeeze(-1).squeeze(-1)
+            # [batch_size x filter_num x 1 x 1]
+            x = x.permute(0, 1)
+            # [batch_size x filter_num]
+            out.append(x)
+
+        out = torch.cat(out, dim=1)
+        # [batch_size x filter_sum]
+        return out
+
+
 class Discriminator(nn.Module):
     def __init__(
         self,
@@ -623,118 +709,69 @@ class Discriminator(nn.Module):
         hidden_size,
         bos_token_id,
         eos_token_id,
+        pad_token_id,
         device,
+        max_filter_size=32,
     ):
         super(Discriminator, self).__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-        self.device_ids = [device]
+        self.pad_token_id = pad_token_id
+        self.device = device
 
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.src_embedding = Embedding(vocab_size, hidden_size, pad_token_id)
+        self.tgt_embedding = Embedding(vocab_size, hidden_size, pad_token_id)
 
-        src_filter_sizes = list(range(1, 32, 4))
-        src_filter_nums = [(i * 10) for i in src_filter_sizes]
-        # src_filter_sizes: [1, 5, 9, 13, 17, ...]
-        # src_filter_nums: [110, 150, 190, ...]
+        filter_sizes = list(range(1, max_filter_size, 4))
+        filter_nums = [100 + i * 10 for i in range(1, max_filter_size, 4)]
+        filter_sum = sum(filter_nums)
+        # filter_sizes: [1, 5, 9, 13, 17, ...]
+        # filter_nums: [110, 150, 190, ...]
 
-        src_filter_sum = sum(src_filter_nums)
+        self.src_filters = Conv2dHub(
+            filter_sizes, filter_nums, hidden_size, source_length)
+        self.tgt_filters = Conv2dHub(
+            filter_sizes, filter_nums, hidden_size, target_length)
 
-        self.src_filters = nn.ModuleList()
+        self.highway = Highway(filter_sum)
 
-        for filter_size, filter_num in zip(src_filter_sizes, src_filter_nums):
-            self.src_filters.append(
-                nn.Sequential(
-                    nn.Conv2d(1, filter_num, kernel_size=(filter_size, hidden_size)),
-                    nn.BatchNorm2d(filter_num),
-                    nn.ReLU(),
-                    nn.MaxPool2d((source_length - filter_size + 1, 1), stride=None),
-                )
-            )
+        # self.src_drop = nn.Dropout()
+        # self.tgt_drop = nn.Dropout()
 
-        self.src_output_lin = nn.Linear(src_filter_sum, src_filter_sum, bias=False)
-        self.src_trans_lin = nn.Linear(src_filter_sum, src_filter_sum, bias=False)
-        self.src_drop = nn.Dropout()
-
-        tgt_filter_sizes = list(range(1, 32, 4))
-        tgt_filter_nums = [(i * 10) for i in tgt_filter_sizes]
-        # src_filter_sizes: [1, 5, 9, 13, 17, ...]
-        # src_filter_nums: [110, 150, 190, ...]
-
-        tgt_filter_sum = sum(tgt_filter_nums)
-
-        self.tgt_filters = nn.ModuleList()
-
-        for filter_size, filter_num in zip(tgt_filter_sizes, tgt_filter_nums):
-            self.tgt_filters.append(
-                nn.Sequential(
-                    nn.Conv2d(1, filter_num, kernel_size=(filter_size, hidden_size)),
-                    nn.BatchNorm2d(filter_num),
-                    nn.ReLU(),
-                    nn.MaxPool2d((target_length - filter_size + 1, 1), stride=None),
-                )
-            )
-
-        self.tgt_output_lin = nn.Linear(tgt_filter_sum, tgt_filter_sum, bias=False)
-        self.tgt_trans_lin = nn.Linear(tgt_filter_sum, tgt_filter_sum, bias=False)
-        self.tgt_drop = nn.Dropout()
-
-        self.hidden2out = nn.Linear(tgt_filter_sum + src_filter_sum, 1)
+        self.hidden2out = Linear(2 * filter_sum, 1)
 
     def forward(self, source_ids: Tensor, target_ids: Tensor):
         """
-	    Inputs:
+            Inputs:
             source_ids: [batch_size x source_length] (value: [0, vocab_size))
             target_ids: [batch_size x target_length] (value: [0, vocab_size))
 
-	    Outputs:
+            Outputs:
             scores: batch_size (value: 0 to 1)
         """
-        x = self.embedding(source_ids).unsqueeze(1)
+        x = self.src_embedding(source_ids).unsqueeze(1)
         # [batch_size x chan(1) x source_length x hidden_size]
-
-        src_outputs = []
-        for src_filter in self.src_filters:
-            x1 = src_filter(x)
-            # batch_size x num_filter_i x 1 x 1
-            x1 = x1.squeeze(-1).squeeze(-1)
-            # batch_size x num_filter_i
-            src_outputs.append(x1)
-        src_outputs = torch.concat(src_outputs, dim=1)
-        # [batch_size x num_filter_sum]
-
-        output = self.src_output_lin(src_outputs).relu()
-        t_gate = self.src_trans_lin(src_outputs).sigmoid()
-        src_output = t_gate * output + (1.0 - t_gate) * src_outputs
-        src_drop = self.src_drop(src_output)
-        # [batch_size x num_filter_sum]
-
-        y = self.embedding(target_ids).unsqueeze(1)
+        y = self.tgt_embedding(target_ids).unsqueeze(1)
         # [batch_size x chan(1) x target_length x hidden_size]
 
-        tgt_outputs = []
-        for tgt_filter in self.tgt_filters:
-            y1 = tgt_filter(y)
-            # batch_size x num_filter_i x 1 x 1
-            y1 = y1.squeeze(-1).squeeze(-1)
-            # batch_size x num_filter_i
-            tgt_outputs.append(y1)
+        src_outputs = self.src_filters(x)
+        tgt_outputs = self.tgt_filters(y)
+        # [batch_size x filter_sum]
 
-        tgt_outputs = torch.concat(tgt_outputs, dim=1)
-        # [batch_size x num_filter_sum]
+        src_outputs = self.highway(src_outputs)
+        tgt_outputs = self.highway(tgt_outputs)
 
-        output = self.tgt_output_lin(tgt_outputs).relu()
-        t_gate = self.tgt_trans_lin(tgt_outputs).sigmoid()
-        tgt_output = t_gate * output + (1.0 - t_gate) * tgt_outputs
-        tgt_drop = self.tgt_drop(tgt_output)
-        # [batch_size x num_filter_sum]
+        # src_outputs = self.src_drop(src_outputs)
+        # tgt_outputs = self.tgt_drop(tgt_outputs)
+        # [batch_size x filter_sum]
 
-        tgt_src = torch.concat([tgt_drop, src_drop], dim=1)
-        # [batch_size x num_filter_sum*2]
+        src_tgt = torch.cat([src_outputs, tgt_outputs], dim=1)
+        # [batch_size x filter_sum*2]
 
         # Get scores [0-1]
-        logits = self.hidden2out(tgt_src).squeeze(1)
+        logits = self.hidden2out(src_tgt).squeeze(1)
         # [batch_size]
-        scores = logits.sigmoid()
+        scores = torch.sigmoid(logits)
         return scores
