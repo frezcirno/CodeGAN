@@ -1,6 +1,7 @@
 # %%
 import logging
 import argparse
+from pathlib import Path
 from os.path import join as path_join
 import sys
 import itertools
@@ -16,6 +17,8 @@ from torch.utils.data import (
     DataLoader,
     RandomSampler,
     TensorDataset,
+    Subset,
+    ConcatDataset,
 )
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
@@ -85,7 +88,7 @@ parser.add_argument(
     "--gen_load_path", help="The path to the generator model",
 )
 parser.add_argument("--gen_train_epochs", type=int, default=10)
-parser.add_argument("--gen_num_workers", type=int, default=2)
+parser.add_argument("--gen_num_workers", type=int, default=4)
 parser.add_argument("--gen_learning_rate", type=float, default=5e-5)
 parser.add_argument("--gen_adam_epsilon", type=float, default=1e-8)
 parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -94,14 +97,14 @@ parser.add_argument("--beam_size", type=int, default=10)
 # Dis
 parser.add_argument("--do_dis_train", action="store_true")
 parser.add_argument("--dis_fakegen_train_sample", type=int, default=5000)
-parser.add_argument("--dis_fakegen_valid_sample", type=int, default=250)
+parser.add_argument("--dis_fakegen_valid_sample", type=int, default=1000)
 parser.add_argument("--dis_fakegen_batch_size", type=int, default=64)
-parser.add_argument("--dis_fakegen_num_workers", type=int, default=2)
+parser.add_argument("--dis_fakegen_num_workers", type=int, default=4)
 parser.add_argument(
     "--dis_load_path", help="The path to the discriminator model",
 )
 parser.add_argument("--dis_train_epochs", type=int, default=10)
-parser.add_argument("--dis_num_workers", type=int, default=2)
+parser.add_argument("--dis_num_workers", type=int, default=4)
 parser.add_argument("--dis_batch_size", type=int, default=64)
 parser.add_argument("--dis_learning_rate", type=float, default=5e-5)
 parser.add_argument("--dis_adam_epsilon", type=float, default=1e-8)
@@ -112,24 +115,26 @@ parser.add_argument("--do_gan_train", action="store_true")
 parser.add_argument("--do_gan_eval", action="store_true")
 parser.add_argument("--gan_batch_size", type=int, default=1)
 parser.add_argument("--gan_train_epochs", type=int, default=30)
-parser.add_argument("--gan_num_workers", type=int, default=2)
+parser.add_argument("--gan_num_workers", type=int, default=4)
 parser.add_argument("--gan_rollnum", type=int, default=5)
 parser.add_argument("--gan_g_steps", type=int, default=1000)
 parser.add_argument("--gan_teach", action="store_true", default=True)
 parser.add_argument("--gan_d_steps", type=int, default=30)
+parser.add_argument("--gan_d_batch_size", type=int, default=64)
+parser.add_argument("--gan_d_num_workers", type=int, default=4)
+parser.add_argument("--gan_d_sample", type=int, default=1000)
+parser.add_argument("--gan_d_epochs", type=int, default=5)
 
 args = parser.parse_args(
     args=[
         "--gen_device_ids",
-        "3",
+        "1",
         "--dis_device_ids",
-        "2",
+        "1",
         "--gen_load_path",
         "checkpoints/2.19/gen/gen_bestbleu_5_19.220000.bin",
         "--dis_load_path",
         "checkpoints/2.19/dis/dis_bestppl_1_0.473262.bin",
-        "--do_gan_train",
-        "--do_gan_eval",
         "--gan_batch_size",
         "2",
         "--gan_train_epochs",
@@ -143,10 +148,15 @@ args = parser.parse_args(
         "--gan_teach",
         "--gan_d_steps",
         "25",
+        "--gan_d_batch_size",
+        "64",
     ]
     if is_notebook()
     else sys.argv[1:]
 )
+
+args.hidden_size = 768
+args.vocab_size = 50265
 
 # For using `torchrun`
 try:
@@ -157,10 +167,9 @@ except KeyError:
 if args.local_rank != -1:
     args.local_rank += args.rank_offset
 
-
-def standalone_or_master():
-    return args.local_rank == -1 or args.local_rank == args.rank_offset
-
+distributing = args.local_rank != -1
+master = args.local_rank == args.rank_offset
+standalone_or_master = not distributing or master
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -183,6 +192,11 @@ logging.basicConfig(
 logging.info(" ".join(sys.argv))
 logging.info(str(args))
 
+output_dir = Path(args.output_dir)
+output_dir.mkdir(exist_ok=True)
+data_dir = Path(args.data_dir)
+data_dir.mkdir(exist_ok=True)
+
 if args.local_rank != -1:
     # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
     torch.cuda.set_device(args.local_rank)
@@ -192,6 +206,7 @@ if args.local_rank != -1:
 
     gen_device = args.local_rank
     dis_device = args.local_rank
+
 
 else:
     args.ngpu = torch.cuda.device_count()
@@ -220,39 +235,70 @@ tokenizer = RobertaTokenizer.from_pretrained(
     "microsoft/codebert-base", do_lower_case=args.do_lower_case
 )
 
-bos_token_id = 0
-pad_token_id = 1
-eos_token_id = 2
-
-jd = pd.read_parquet(args.data)
-
-feats = cache_call(path_join(args.data_dir, "feats"), to_features)(jd, tokenizer)
-
-pad_feats = cache_call(path_join(args.data_dir, "pad_feats"), to_pad_features)(
-    feats,
-    args.source_length,
-    args.target_length,
-    bos_token_id,
-    eos_token_id,
-    pad_token_id,
-)
-
-# %%
-train_mask = jd.partition == "train"
-# test_mask = jd.partition == "test"
-valid_mask = jd.partition == "valid"
-
-train_feats = pad_feats[train_mask]
-# test_feats = pad_feats[test_mask]
-valid_feats = pad_feats[valid_mask]
-
-jd_bleu = cache_call(path_join(args.data_dir, "jd_bleu"), sample_dataset)(
-    jd[valid_mask]
-)
-bleu_feats = pad_feats.loc[jd_bleu.index]
+args.bos_token_id = 0
+args.pad_token_id = 1
+args.eos_token_id = 2
 
 
-def make_dataset(feats):
+@remember_result
+def make_jd():
+    return pd.read_parquet(args.data)
+
+
+@remember_result
+@cache_result(data_dir / "feats")
+def make_feats():
+    jd = make_jd()
+    return to_features(jd, tokenizer)
+
+
+@remember_result
+@cache_result(data_dir / "pad_feats")
+def make_pad_feats():
+    feats = make_feats()
+    return to_pad_features(feats,
+                           args.source_length,
+                           args.target_length,
+                           args.bos_token_id,
+                           args.eos_token_id,
+                           args.pad_token_id)
+
+
+@remember_result
+@cache_result(data_dir / "train_feats")
+def make_train_feats():
+    jd = make_jd()
+    pad_feats = make_pad_feats()
+    return pad_feats[jd.partition == "train"]
+
+
+@remember_result
+@cache_result(data_dir / "valid_feats")
+def make_valid_feats():
+    jd = make_jd()
+    pad_feats = make_pad_feats()
+    return pad_feats[jd.partition == "valid"]
+
+
+@remember_result
+@cache_result(data_dir / "jd_bleu")
+def make_jd_bleu():
+    jd = make_jd()
+    return sample_dataset(jd[jd.partition == "valid"])
+
+
+@remember_result
+@cache_result(data_dir / "bleu_feats")
+def make_bleu_feats():
+    pad_feats = make_pad_feats()
+    jd_bleu = make_jd_bleu()
+    return pad_feats.loc[jd_bleu.index]
+
+
+@remember_result
+@cache_result(data_dir / "train_dataset", "pickle")
+def make_train_dataset():
+    feats = make_train_feats()
     return TensorDataset(
         series_to_tensor(feats.code_ids),
         series_to_tensor(feats.code_mask),
@@ -261,24 +307,33 @@ def make_dataset(feats):
     )
 
 
-def make_dataset_bleu(feats):
+@remember_result
+@cache_result(data_dir / "valid_dataset", "pickle")
+def make_valid_dataset():
+    feats = make_valid_feats()
     return TensorDataset(
-        series_to_tensor(feats.code_ids), series_to_tensor(feats.code_mask),
+        series_to_tensor(feats.code_ids),
+        series_to_tensor(feats.code_mask),
+        series_to_tensor(feats.doc_ids),
+        series_to_tensor(feats.doc_mask),
     )
 
 
-train_dataset = cache_call(
-    path_join(args.data_dir, "train_dataset"), make_dataset, "pickle"
-)(train_feats)
-# test_dataset = cache_call(
-#     path_join(args.data_dir, "test_dataset"), make_dataset, "pickle"
-# )(test_feats)
-valid_dataset = cache_call(
-    path_join(args.data_dir, "valid_dataset"), make_dataset, "pickle"
-)(valid_feats)
-bleu_dataset = cache_call(
-    path_join(args.data_dir, "bleu_dataset"), make_dataset_bleu, "pickle"
-)(bleu_feats)
+@remember_result
+@cache_result(data_dir / "bleu_dataset", "pickle")
+def make_bleu_dataset():
+    feats = make_bleu_feats()
+    return TensorDataset(
+        series_to_tensor(feats.code_ids),
+        series_to_tensor(feats.code_mask),
+    )
+
+
+jd_bleu = make_jd_bleu()
+bleu_feats = make_bleu_feats()
+train_dataset = make_train_dataset()
+valid_dataset = make_valid_dataset()
+bleu_dataset = make_bleu_dataset()
 
 logging.info("train dataset: %d samples", len(train_dataset))
 # logging.info("test dataset: %d samples", len(test_dataset))
@@ -288,44 +343,89 @@ logging.info("bleu dataset: %d samples", len(bleu_dataset))
 # %%
 # [Load model]
 # config = RobertaConfig.from_pretrained("microsoft/codebert-base")
-hidden_size = 768
-vocab_size = 50265
 
-if args.do_gen_train or args.do_gen_eval or args.do_dis_train or args.do_gan_train:
-    _gen = Generator(
-        hidden_size,
-        vocab_size,
+
+def build_gen(args, load_path="", device=0, distributing=False, device_ids=[]):
+    _model = Generator(
+        args.hidden_size,
+        args.vocab_size,
         args.beam_size,
         args.target_length,
-        bos_token_id,
-        eos_token_id,
-        pad_token_id,
-        gen_device,
+        args.bos_token_id,
+        args.eos_token_id,
+        args.pad_token_id,
+        device,
     )
-
-    if args.gen_load_path:
-        logging.info("Load generator from: %s", args.gen_load_path)
-        _gen.load_state_dict(
-            torch.load(args.gen_load_path, map_location=torch.device(gen_device))
+    if load_path:
+        logging.info("Load generator from: %s", load_path)
+        _model.load_state_dict(
+            torch.load(load_path,
+                       map_location=torch.device(device))
         )
 
-    logging.info("Load generator on device %d", gen_device)
-    _gen.to(gen_device)
-    if args.local_rank != -1 and not args.gen_no_ddp:
+    logging.info("Load generator on device %d", device)
+    _model.to(device)
+
+    if distributing:
         logging.info("Build DDP generator")
-        gen = DDP(
-            _gen,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
+        model = DDP(
+            _model,
+            device_ids=[device],
+            output_device=device,
             find_unused_parameters=True,
             broadcast_buffers=False,
         )
-    elif len(args.gen_device_ids) > 1:
+    elif len(device_ids) > 1:
         logging.info("Build DP generator")
-        gen = DP(_gen, device_ids=args.gen_device_ids)
+        model = DP(_model, device_ids)
     else:
         logging.info("Build generator")
-        gen = _gen
+        model = _model
+
+    return _model, model
+
+
+def build_dis(args, load_path="", device=0, distributing=False, device_ids=[]):
+    _model = Discriminator(
+        args.source_length,
+        args.target_length,
+        args.vocab_size,
+        args.hidden_size,
+        args.bos_token_id,
+        args.eos_token_id,
+        args.pad_token_id,
+        device,
+    )
+    if load_path:
+        logging.info("Load discriminator from: %s", load_path)
+        _model.load_state_dict(
+            torch.load(load_path,
+                       map_location=torch.device(device))
+        )
+    _model.to(device)
+
+    if distributing:
+        logging.info("Build DDP discriminator")
+        model = DDP(
+            _model,
+            device_ids=[device],
+            output_device=device,
+            find_unused_parameters=True,
+            broadcast_buffers=False,
+        )
+    elif len(device_ids) > 1:
+        logging.info("Build DP discriminator")
+        model = DP(_model, device_ids)
+    else:
+        logging.info("Build discriminator")
+        model = _model
+
+    return _model, model
+
+
+if args.do_gen_train or args.do_gen_eval or args.do_dis_train or args.do_gan_train:
+    _gen, gen = build_gen(args, args.gen_load_path,
+                          gen_device, distributing, args.gen_device_ids)
 
     # TODO: Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
@@ -351,38 +451,10 @@ if args.do_gen_train or args.do_gen_eval or args.do_dis_train or args.do_gan_tra
         eps=args.gen_adam_epsilon,
     )
 
+
 if args.do_dis_train or args.do_gan_train:
-    dis = Discriminator(
-        args.source_length,
-        args.target_length,
-        vocab_size,
-        hidden_size,
-        bos_token_id,
-        eos_token_id,
-        dis_device,
-    )
-
-    if args.dis_load_path:
-        logging.info("Load discriminator from: %s", args.dis_load_path)
-        dis.load_state_dict(
-            torch.load(args.dis_load_path, map_location=torch.device(dis_device))
-        )
-
-    logging.info("Load discriminator on device %d", dis_device)
-    dis.to(dis_device)
-    if args.local_rank != -1 and not args.dis_no_ddp:
-        logging.info("Build DDP discriminator")
-        dis = DDP(
-            dis,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            broadcast_buffers=False,
-        )
-    elif len(args.dis_device_ids) > 1:
-        logging.info("Build DP discriminator")
-        dis = DP(dis, device_ids=args.dis_device_ids)
-    else:
-        logging.info("Build discriminator")
+    _dis, dis = build_dis(args, args.dis_load_path,
+                          dis_device, distributing, args.dis_device_ids)
 
     d_optimizer = optim.Adam(
         dis.parameters(), lr=args.dis_learning_rate, eps=args.dis_adam_epsilon
@@ -467,10 +539,12 @@ for epoch in range(
             target_mask = batch[3].to(gen_device)
 
             g_optimizer.zero_grad()
-            context, memory_key_padding_mask = _gen.get_context(source_ids, source_mask)
-            # [batch_size x source_length x hidden_size]
+            context, memory_key_padding_mask = _gen.get_context(
+                source_ids, source_mask)
+            # [batch_size x source_length x args.hidden_size]
 
-            loss, _, _ = gen(context, memory_key_padding_mask, target_ids, target_mask)
+            loss, _, _ = gen(context, memory_key_padding_mask,
+                             target_ids, target_mask)
             if loss.size():
                 loss = loss.mean()  # mean() to average on multi-gpu.
             loss.backward()
@@ -478,7 +552,7 @@ for epoch in range(
             tr_loss += loss.item()
             train_loss = round(tr_loss / (nb_tr_steps + 1), 4)
             train_bar.set_description(f"EP {epoch} loss {train_loss:.2f}")
-            nb_tr_examples = nb_tr_examples + source_ids.size(0)
+            nb_tr_examples = nb_tr_examples + args.source_length
             nb_tr_steps += 1
 
             # Update parameters
@@ -487,11 +561,11 @@ for epoch in range(
             global_step += 1
 
         # Save last checkpoint
-        if standalone_or_master():
+        if standalone_or_master:
             save_model(gen, checkpoint_last)
 
     # Eval
-    if args.do_gen_eval and standalone_or_master():
+    if args.do_gen_eval and standalone_or_master:
         # Eval model with dev dataset
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
@@ -514,7 +588,7 @@ for epoch in range(
                 context, memory_key_padding_mask = _gen.get_context(
                     source_ids, source_mask
                 )
-                # [batch_size x source_length x hidden_size]
+                # [batch_size x source_length x args.hidden_size]
 
                 loss, num, _ = gen(
                     context, memory_key_padding_mask, target_ids, target_mask
@@ -570,50 +644,35 @@ if args.do_dis_train:
     logging.info("+ generate train sample = %d", args.dis_fakegen_train_sample)
     logging.info("+ generate valid sample = %d", args.dis_fakegen_valid_sample)
 
-    train_dataset_slim = TensorDataset(
-        train_dataset.tensors[0][: args.dis_fakegen_train_sample],
-        train_dataset.tensors[1][: args.dis_fakegen_train_sample],
-        train_dataset.tensors[2][: args.dis_fakegen_train_sample],
-        train_dataset.tensors[3][: args.dis_fakegen_train_sample],
-    )
+    train_dataset_sub = Subset(
+        train_dataset, range(args.dis_fakegen_train_sample))
 
+    valid_dataset_sub = Subset(
+        valid_dataset, range(args.dis_fakegen_valid_sample))
+
+    def __make(dataset):
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.dis_fakegen_batch_size,
+            num_workers=args.dis_fakegen_num_workers,
+            pin_memory=True,
+        )
+        return make_fake_dataset(_gen, dataloader)
+
+    path = path_join(args.data_dir,
+                     f"fake_train_dataset_{args.dis_fakegen_train_sample}")
     fake_train_dataset = cache_call(
-        path_join(args.data_dir, f"fake_train_dataset_{args.dis_fakegen_train_sample}"),
-        make_fake_dataset,
-        format="torch",
-    )(
-        _gen,
-        DataLoader(
-            train_dataset_slim,
-            batch_size=args.dis_fakegen_batch_size,
-            num_workers=args.dis_fakegen_num_workers,
-            pin_memory=True,
-        ),
-    )
+        path, __make, format="torch")(train_dataset_sub)
 
-    valid_dataset_slim = TensorDataset(
-        valid_dataset.tensors[0][: args.dis_fakegen_valid_sample],
-        valid_dataset.tensors[1][: args.dis_fakegen_valid_sample],
-        valid_dataset.tensors[2][: args.dis_fakegen_valid_sample],
-        valid_dataset.tensors[3][: args.dis_fakegen_valid_sample],
-    )
-
+    path = path_join(args.data_dir,
+                     f"fake_valid_dataset_{args.dis_fakegen_valid_sample}")
     fake_valid_dataset = cache_call(
-        path_join(args.data_dir, f"fake_valid_dataset_{args.dis_fakegen_valid_sample}"),
-        make_fake_dataset,
-        format="torch",
-    )(
-        _gen,
-        DataLoader(
-            valid_dataset_slim,
-            batch_size=args.dis_fakegen_batch_size,
-            num_workers=args.dis_fakegen_num_workers,
-            pin_memory=True,
-        ),
-    )
+        path, __make, format="torch")(valid_dataset_sub)
 
-    dis_train_dataset = mix_dataset(train_dataset_slim, fake_train_dataset)
-    dis_valid_dataset = mix_dataset(valid_dataset_slim, fake_valid_dataset)
+    dis_train_dataset = mix_dataset(
+        train_dataset_sub, fake_train_dataset, [0, 2])
+    dis_valid_dataset = mix_dataset(
+        valid_dataset_sub, fake_valid_dataset, [0, 2])
 
     min_loss = 1e6
     dis_last_path = path_join(args.output_dir, "dis.bin")
@@ -636,14 +695,14 @@ if args.do_dis_train:
         dis_train_dataset,
         batch_size=args.dis_batch_size,
         num_workers=args.dis_num_workers,
-        pin_memory=False,
+        pin_memory=True,
         sampler=dis_train_sampler,
     )
     mixed_valid_dataloader = DataLoader(
         dis_valid_dataset,
         batch_size=args.dis_batch_size,
         num_workers=args.dis_num_workers,
-        pin_memory=False,
+        pin_memory=True,
     )
 
 for epoch in range(args.dis_train_epochs if args.do_dis_train else 0):
@@ -651,9 +710,8 @@ for epoch in range(args.dis_train_epochs if args.do_dis_train else 0):
     bar = tqdm(mixed_train_dataloader)
     for batch in bar:
         source_ids = batch[0].to(dis_device)
-        # source_mask = batch[1].to(dis_device)
-        target_ids = batch[2].to(dis_device)
-        labels = batch[3].to(dis_device)
+        target_ids = batch[1].to(dis_device)
+        labels = batch[2].to(dis_device)
 
         d_optimizer.zero_grad()
         pred = dis(source_ids, target_ids)
@@ -666,40 +724,36 @@ for epoch in range(args.dis_train_epochs if args.do_dis_train else 0):
         loss.backward()
         d_optimizer.step()
 
-    if standalone_or_master():
+    if standalone_or_master:
         save_model(dis, dis_last_path)
 
-        all_loss, loss_num = 0, 0
+    all_loss, loss_num = 0, 0
 
-        dis.eval()
-        with torch.no_grad():
-            bar = tqdm(mixed_valid_dataloader)
-            for batch in bar:
-                source_ids = batch[0].to(dis_device)
-                # source_mask = batch[1].to(dis_device)
-                target_ids = batch[2].to(dis_device)
-                labels = batch[3].to(dis_device)
+    dis.eval()
+    with torch.no_grad():
+        bar = tqdm(mixed_valid_dataloader)
+        for batch in bar:
+            source_ids = batch[0].to(dis_device)
+            target_ids = batch[1].to(dis_device)
+            labels = batch[2].to(dis_device)
 
-                pred = dis(source_ids, target_ids)
-                loss = F.binary_cross_entropy(pred, labels)
-                # mean() to average on multi-gpu
-                if loss.size():
-                    loss = loss.mean()
-                all_loss += loss.item()
-                loss_num += 1
-                bar.set_description(f"dis eval loss {loss.item():.2f}")
+            pred = dis(source_ids, target_ids)
+            loss = F.binary_cross_entropy(pred, labels)
+            # mean() to average on multi-gpu
+            if loss.size():
+                loss = loss.mean()
+            all_loss += loss.item()
+            loss_num += 1
+            bar.set_description(f"dis eval loss {loss.item():.2f}")
 
-        all_loss /= loss_num
-        logging.info("+ eval loss = %f", all_loss)
+    all_loss /= loss_num
+    logging.info("+ eval loss = %f", all_loss)
 
-        if all_loss < min_loss:
-            logging.info("+ Best loss !!")
-            min_loss = all_loss
+    if all_loss < min_loss:
+        logging.info("+ Best loss !!")
+        min_loss = all_loss
+        if standalone_or_master:
             save_model(dis, dis_best_path % (epoch, min_loss))
-
-            if args.dis_early_stop_loss and loss < args.dis_early_stop_loss:
-                logging.info("The result is pretty good, stop training.")
-                break
 
 # %%
 if args.do_gan_train or args.do_gan_eval:
@@ -722,20 +776,6 @@ if args.do_gan_train or args.do_gan_eval:
         num_workers=args.gan_num_workers,
         pin_memory=True,
         sampler=gan_train_sampler,
-    )
-
-    gan_valid_dataloader = DataLoader(
-        valid_dataset,
-        batch_size=args.gan_batch_size,
-        num_workers=args.gan_num_workers,
-        pin_memory=True,
-    )
-
-    gan_valid_dataloader_bleu = DataLoader(
-        bleu_dataset,
-        batch_size=args.gan_batch_size,
-        num_workers=args.gan_num_workers,
-        pin_memory=True,
     )
 
     logging.info("+ train dataset = %d", len(train_dataset))
@@ -764,8 +804,10 @@ if args.do_gan_train or args.do_gan_eval:
     gan_dis_path = path_join(args.output_dir, "gan_dis.bin")
     gan_gen_best_ppl = path_join(args.output_dir, "gan_gen_bestppl_%d_%f.bin")
     gan_dis_best_ppl = path_join(args.output_dir, "gan_dis_bestppl_%d_%f.bin")
-    gan_gen_best_bleu = path_join(args.output_dir, "gan_gen_bestbleu_%d_%f.bin")
-    gan_dis_best_bleu = path_join(args.output_dir, "gan_dis_bestbleu_%d_%f.bin")
+    gan_gen_best_bleu = path_join(
+        args.output_dir, "gan_gen_bestbleu_%d_%f.bin")
+    gan_dis_best_bleu = path_join(
+        args.output_dir, "gan_dis_bestbleu_%d_%f.bin")
     gan_output_file = path_join(args.output_dir, "gan_dev.output")
     gan_gold_file = path_join(args.output_dir, "gan_dev.gold")
 
@@ -781,28 +823,43 @@ if args.do_gan_train or args.do_gan_eval:
     best_bleu = 0
     best_loss = 1e6
 
-    train_iter = iter(itertools.cycle(gan_train_dataloader))
-    valid_iter = iter(itertools.cycle(gan_valid_dataloader))
+    train_cycle_iter = iter(itertools.cycle(gan_train_dataloader))
+
+    gan_d_dataset = Subset(train_dataset, range(args.gan_d_sample))
+
+    gan_d_dataloader = DataLoader(
+        gan_d_dataset,
+        batch_size=args.dis_fakegen_batch_size,
+        num_workers=args.dis_fakegen_num_workers,
+        pin_memory=True,
+    )
 
 for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
 
-    ## G-step
+    # G-step
+    gen.train()
     g_step_bar = trange(args.gan_g_steps)
     g_step = iter(g_step_bar)
-    g_running = True
-    while g_running:
-        batch = next(train_iter)
+    while True:
+        try:
+            next(g_step)
+        except StopIteration:
+            break
+
+        batch = next(train_cycle_iter)
 
         source_ids = batch[0].to(gen_device)
         source_mask = batch[1].to(gen_device)
 
-        context, memory_key_padding_mask = _gen.get_context(source_ids, source_mask)
-        # [batch_size x source_length x hidden_size]
+        g_optimizer.zero_grad()
 
-        gen.train()
+        context, memory_key_padding_mask = _gen.get_context(
+            source_ids, source_mask)
+        # [batch_size x source_length x args.hidden_size]
+
         pre_target_ids, _ = gen(context, memory_key_padding_mask)
         pre_target_ids, pre_target_mask = get_target_mask(
-            pre_target_ids, bos_token_id, eos_token_id, pad_token_id,
+            pre_target_ids, args.bos_token_id, args.eos_token_id, args.pad_token_id,
         )
         rewards = rollout.get_reward(
             source_ids,
@@ -812,7 +869,8 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
             pre_target_mask,
             rollnum=args.gan_rollnum,
         )
-        loss = gen(context, memory_key_padding_mask, pre_target_ids, rewards=rewards)
+        loss = gen(context, memory_key_padding_mask,
+                   pre_target_ids, rewards=rewards)
 
         if loss.size():
             loss = loss.mean()
@@ -821,20 +879,23 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
 
         loss.backward()
         g_optimizer.step()
-        g_optimizer.zero_grad()
         gan_gen_scheduler.step()
 
         if args.gan_teach:
-            ## teacher forcing
+            # teacher forcing
             target_ids = batch[2].to(gen_device)
             target_mask = batch[3].to(gen_device)
 
-            context, memory_key_padding_mask = _gen.get_context(source_ids, source_mask)
-            # [batch_size x source_length x hidden_size]
+            g_optimizer.zero_grad()
 
-            gen.train()
-            rewards = torch.ones_like(target_ids) * target_mask  # right answer!
-            tloss = gen(context, memory_key_padding_mask, target_ids, rewards=rewards)
+            context, memory_key_padding_mask = _gen.get_context(
+                source_ids, source_mask)
+            # [batch_size x source_length x args.hidden_size]
+
+            rewards = torch.ones_like(target_ids) * \
+                target_mask  # right answer!
+            tloss = gen(context, memory_key_padding_mask,
+                        target_ids, rewards=rewards)
 
             if tloss.size():
                 tloss = tloss.mean()
@@ -845,82 +906,66 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
 
             tloss.backward()
             g_optimizer.step()
-            g_optimizer.zero_grad()
             gan_gen_scheduler.step()
 
-        try:
-            next(g_step)
-        except StopIteration:
-            g_running = False
-            break
+    save_model(gen, gan_gen_path)
 
-    ## D-step
-    d_step_bar = trange(args.gan_d_steps)
-    d_step = iter(d_step_bar)
-    d_running = True
-    while d_running:
-        batch = next(valid_iter)
+    # D-step
+    gen.eval()
+    dis.train()
+    for d_step in trange(args.gan_d_steps):
+        # (re)generate fake dataset
 
-        source_ids = batch[0].to(dis_device)
-        source_mask = batch[1].to(dis_device)
-        target_ids = batch[2].to(dis_device)
+        fake_train_dataset = make_fake_dataset(_gen, gan_d_dataloader)
+        dis_train_dataset = ConcatDataset([gan_d_dataset, fake_train_dataset])
 
-        dis.train()
-        pred = dis(source_ids, target_ids)
-        loss1 = F.binary_cross_entropy(
-            pred, torch.ones(source_ids.size(0)).to(dis_device)
+        sampler = RandomSampler(dis_train_dataset)
+        mixed_valid_dataloader = DataLoader(
+            dis_train_dataset,
+            sampler=sampler,
+            batch_size=args.gan_d_batch_size,
+            num_workers=args.gan_d_num_workers,
+            pin_memory=True,
         )
-        if loss1.size():
-            loss1 = loss1.mean()  # mean() to average on multi-gpu
 
-        gen.eval()
-        with torch.no_grad():
-            # context, memory_key_padding_mask = _gen.get_context(
-            #     source_ids.to(gen_device), source_mask.to(gen_device)
-            # )
-            # # [batch_size x source_length x hidden_size]
+        # Train dis for k epochs
+        for d_epoch in args.gan_d_epochs:
+            dis_train_dataset_bar = tqdm(dis_train_dataset)
+            for batch in dis_train_dataset_bar:
+                source_ids = batch[0].to(dis_device)
+                target_ids = batch[1].to(dis_device)
+                label = batch[2].to(dis_device)
 
-            # g_target_ids, _ = gen(context, memory_key_padding_mask)
+                d_optimizer.zero_grad()
 
-            # g_target_ids, _ = get_target_mask(
-            #     g_target_ids, bos_token_id, eos_token_id, pad_token_id,
-            # )
-            g_target_ids = _gen.beam_predict(
-                source_ids.to(gen_device), source_mask.to(gen_device)
-            ).to(dis_device)
+                pred = dis(source_ids, target_ids)
+                loss = F.binary_cross_entropy(pred, label)
+                if loss.size():
+                    loss = loss.mean()  # mean() to average on multi-gpu
 
-        pred = dis(source_ids, g_target_ids)
-        loss2 = F.binary_cross_entropy(
-            pred, torch.zeros(source_ids.size(0)).to(dis_device)
-        )
-        if loss2.size():
-            loss2 = loss2.mean()  # mean() to average on multi-gpu
+                dis_train_dataset_bar.set_description(
+                    f"{epoch}:{d_step}:{d_epoch} loss {loss.item():.2f}"
+                )
 
-        loss = loss1 + loss2
-        loss.backward()
+                loss.backward()
+                d_optimizer.step()
 
-        d_step_bar.set_description(f"EP {epoch} d-step loss {loss.item():.2f}")
+    save_model(dis, gan_dis_path)
 
-        d_optimizer.step()
-        d_optimizer.zero_grad()
-
-        try:
-            next(d_step)
-        except StopIteration:
-            d_running = False
-            break
-
-    if args.do_gan_eval and standalone_or_master():
-        save_model(gen, gan_gen_path)
-        save_model(dis, gan_dis_path)
-
-        ## Eval G with dev dataset
+    if args.do_gan_eval and standalone_or_master:
+        # Eval G with dev dataset
         logging.info("Do evaluation:")
         logging.info("+ Valid dataset = %d", len(valid_dataset))
 
         gen.eval()
         eval_loss = 0
         tokens_num = 0
+        gan_valid_dataloader = DataLoader(
+            valid_dataset,
+            batch_size=args.gan_batch_size,
+            num_workers=args.gan_num_workers,
+            pin_memory=True,
+        )
 
         for batch in tqdm(gan_valid_dataloader, "validation"):
             source_ids = batch[0].to(gen_device)
@@ -932,7 +977,7 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
                 context, memory_key_padding_mask = _gen.get_context(
                     source_ids, source_mask
                 )
-                # [batch_size x source_length x hidden_size]
+                # [batch_size x source_length x args.hidden_size]
 
                 loss, num, _ = gen(
                     context, memory_key_padding_mask, target_ids, target_mask
@@ -947,7 +992,7 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
         eval_loss = eval_loss / tokens_num
         logging.info("+ eval loss = %f", eval_loss)
 
-        if eval_loss < best_loss:
+        if args.do_gan_train and eval_loss < best_loss:
             logging.info("+ Best loss !!")
             best_loss = eval_loss
 
@@ -956,6 +1001,12 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
 
         # Save best checkpoint for best bleu
         gen.eval()
+        gan_valid_dataloader_bleu = DataLoader(
+            bleu_dataset,
+            batch_size=args.gan_batch_size,
+            num_workers=args.gan_num_workers,
+            pin_memory=True,
+        )
         predicts = []
         for batch in tqdm(gan_valid_dataloader_bleu, "bleu"):
             source_ids = batch[0].to(gen_device)
@@ -977,7 +1028,7 @@ for epoch in range(args.gan_train_epochs if args.do_gan_train else 0):
         dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
         logging.info("+ bleu-4 = %f", dev_bleu)
 
-        if dev_bleu > best_bleu:
+        if args.do_gan_train and dev_bleu > best_bleu:
             logging.info("+ Best bleu !!")
             best_bleu = dev_bleu
 
