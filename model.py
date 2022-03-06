@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import pytorch_lightning as pl
+# import pytorch_lightning as pl
 
 # from transformers import RobertaModel
 from modeling_roberta import RobertaModel
@@ -203,7 +203,7 @@ class Generator(nn.Module):
 
         # Beam search for every sample
         for i in range(batch_size):
-            beam = Beam(self.beam_size, self.bos_id, self.eos_id)
+            beam = Beam(self.beam_size, self.bos_id, self.eos_id, source_ids.device)
             btarget_ids = beam.getCurrentState(source_ids.device)
             # [beam_size x 1]
             ctx = context[:, i: i + 1].repeat(1, self.beam_size, 1)
@@ -438,14 +438,14 @@ class Generator(nn.Module):
 
 
 class Beam(object):
-    def __init__(self, size, sos, eos):
+    def __init__(self, size, sos, eos, device):
         self.size = size
         # The score for each translation on the beam.
-        self.scores = torch.cuda.FloatTensor(size).zero_()
+        self.scores = torch.zeros(size, dtype=torch.float, device=device)
         # The backpointers at each time-step.
         self.prevKs = []
         # The outputs at each time-step.
-        self.nextYs = [torch.cuda.LongTensor(size).fill_(0)]
+        self.nextYs = [torch.zeros(size, dtype=torch.long, device=device)]
         self.nextYs[0][0] = sos
         # Has EOS topped the beam yet.
         self._eos = eos

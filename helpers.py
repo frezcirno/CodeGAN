@@ -7,9 +7,10 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.functional import Tensor, F
-from torch.utils.data import TensorDataset, ConcatDataset
+from torch.utils.data import Dataset, TensorDataset, ConcatDataset
 from tqdm import tqdm
 from pandas.io.parquet import to_parquet
+from typing import List, Sequence
 
 from model import Discriminator
 
@@ -77,7 +78,7 @@ def get_target_mask(target_ids: Tensor, bos_token_id, eos_token_id, pad_token_id
             index_of_eos = (batch == eos_token_id).nonzero()[0]
         except IndexError:
             continue
-        mask[i][index_of_eos + 1 :] = 0
+        mask[i][index_of_eos + 1:] = 0
 
     target_ids[(1 - mask).bool()] = pad_token_id
     mask = mask.to(target_ids.device)
@@ -194,7 +195,7 @@ def write_output(output_file, gold_file, indexs, predicts, golds):
 
 def id_to_text(tkzr, pred_ids: List[int]):
     if tkzr.bos_token_id in pred_ids:
-        pred_ids = pred_ids[pred_ids.index(tkzr.bos_token_id) + 1 :]
+        pred_ids = pred_ids[pred_ids.index(tkzr.bos_token_id) + 1:]
     if tkzr.eos_token_id in pred_ids:
         pred_ids = pred_ids[: pred_ids.index(tkzr.eos_token_id)]
     if tkzr.pad_token_id in pred_ids:
@@ -337,7 +338,7 @@ def make_fake_dataset(_gen, dataloader):
 
     _gen.eval()
     with torch.no_grad():
-        for batch in tqdm(dataloader, "making fake dataset"):
+        for batch in tqdm(dataloader, "Making fake dataset"):
             source_ids = batch[0]
             source_mask = batch[1]
 
@@ -356,6 +357,87 @@ def make_fake_dataset(_gen, dataloader):
     return TensorDataset(fake_source_ids, fake_source_mask, fake_target_ids)
 
 
+def make_fake_dataset2(_gen, dataloader):
+    all_source_ids = []
+    all_target_ids = []
+    all_labels = []
+
+    device = _gen.device
+
+    _gen.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, "Making fake dataset"):
+            source_ids = batch[0]
+            source_mask = batch[1]
+            target_ids = batch[2]
+
+            batch_size = source_ids.size(0)
+
+            all_source_ids.append(source_ids)
+            all_target_ids.append(target_ids)
+            all_labels.append(torch.ones(batch_size, dtype=torch.float))
+
+            g_target_ids = _gen.beam_predict(
+                source_ids.to(device), source_mask.to(device), "cpu"
+            )
+
+            all_source_ids.append(source_ids)
+            all_target_ids.append(g_target_ids)
+            all_labels.append(torch.zeros(batch_size, dtype=torch.float))
+
+    all_source_ids = torch.cat(all_source_ids)
+    all_target_ids = torch.cat(all_target_ids)
+    all_labels = torch.cat(all_labels)
+
+    return TensorDataset(all_source_ids, all_target_ids, all_labels)
+
+
+class SelectDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, columns: Sequence[int]) -> None:
+        super(SelectDataset, self).__init__()
+        self.dataset = dataset
+        self.columns = columns
+
+        assert all(column in range(len(
+            self.dataset[0])) for column in columns), 'columns overflow'
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return tuple(col
+                     for i, col in enumerate(self.dataset[idx])
+                     if i in self.columns)
+
+
+class CombineDataset(Dataset):
+
+    def __init__(self, *datasets: Dataset) -> None:
+        super(CombineDataset, self).__init__()
+        self.datasets = datasets
+
+    def __len__(self):
+        return len(self.datasets[0])
+
+    def __getitem__(self, idx):
+        return tuple(el for dataset in self.datasets for el in dataset[idx])
+
+
+class ConstDataset(Dataset):
+
+    def __init__(self, value: Tensor, size: int) -> None:
+        super(ConstDataset, self).__init__()
+        self.value = value
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        return (self.value.clone(),)
+
+
 def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
     """
     Combine two dataset.
@@ -366,18 +448,15 @@ def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
     Output:
         mixed_dataset: (source_ids, source_mask, target_ids, label)
     """
-    real_datas = []
-    fake_datas = []
+    real_dataset = CombineDataset(
+        SelectDataset(real_dataset, keep_col),
+        ConstDataset(torch.tensor(1.0), len(real_dataset))
+    )
+    fake_dataset = CombineDataset(
+        SelectDataset(fake_dataset, keep_col),
+        ConstDataset(torch.tensor(0.0), len(fake_dataset))
+    )
 
-    for col in keep_col:
-        real_datas.append(real_dataset.tensors[col])
-        fake_datas.append(fake_dataset.tensors[col])
-
-    real_datas.append(torch.ones(len(fake_dataset)))
-    fake_datas.append(torch.zeros(len(fake_dataset)))
-
-    real_dataset = TensorDataset(real_datas)
-    fake_dataset = TensorDataset(fake_datas)
     return ConcatDataset([real_dataset, fake_dataset])
 
 
@@ -426,4 +505,3 @@ def is_notebook():
             return False  # Other type (?)
     except NameError:
         return False  # Probably standard Python interpreter
-
