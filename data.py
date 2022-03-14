@@ -4,7 +4,7 @@ from typing import List
 import pandas as pd
 from pathlib import Path
 import string
-import utils
+import process_utils as utils
 import langdetect
 
 # %%
