@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import tokenizer
 # import pytorch_lightning as pl
 
 # from transformers import RobertaModel
@@ -19,9 +20,6 @@ class Generator(nn.Module):
         * `vocab_size` - size of vocab
         * `beam_size`- beam size for beam search.
         * `max_length`- max length of target for beam search.
-        * `bos_id`- start of symbol ids in target for beam search.
-        * `eos_id`- end of symbol ids in target for beam search.
-        * `pad_id`- padding ids.
     """
 
     def __init__(
@@ -30,9 +28,6 @@ class Generator(nn.Module):
         vocab_size: int,
         beam_size: int,
         max_length: int,
-        bos_id: int,
-        eos_id: int,
-        pad_id: int,
         device,
     ):
         super(Generator, self).__init__()
@@ -44,9 +39,6 @@ class Generator(nn.Module):
         self.vocab_size = vocab_size
         self.beam_size = beam_size
         self.max_length = max_length
-        self.bos_id = bos_id
-        self.eos_id = eos_id
-        self.pad_id = pad_id
         self.device = device
 
         # register_buffer() - 模型的常量参数, 不会被训练
@@ -130,13 +122,13 @@ class Generator(nn.Module):
             context: [batch_size x source_length x hidden_size]
             memory_key_padding_mask = (1 - source_mask).bool()
             target_ids: [batch_size x target_length]
-                        values: [id(cls), ..., id(sep), n * id(pad)]
+                        values: [id(bos), ..., id(eos), n * id(pad)]
             target_mask: [batch_size x target_length]
                         values: [   1,    ...,    1,    n * 0]
 
         Outputs:
-            loss
-            active_loss_sum
+            loss: average of all loss
+            active_loss: the number of loss
             lm_logits: [batch_size x target_length x vocab_size]
         """
 
@@ -161,25 +153,26 @@ class Generator(nn.Module):
         )  # [target_length x batch_size x hidden_size]
 
         # Activate
+        # [batch_size x target_length x hidden_size], starts with the first valid token
         hidden_states = self.dense(out).tanh().permute([1, 0, 2]).contiguous()
-        # [batch_size x target_length x hidden_size]
-
         lm_logits = self.lm_head(hidden_states)
-        # [batch_size x target_length x vocab_size]
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        # Remove eos_token
+
+        # Truncate
         # [batch_size x (target_length-1) x vocab_size]
-        active_loss = target_mask[..., 1:].ne(0).reshape(-1)
-        # Remove bos_token
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+
+        # Eval bos_token is invalid
         # [(batch_size*(target_length-1)) ]
+        active_target = target_ids[..., 1:].reshape(-1)
+        active_loss = target_mask[..., 1:].ne(0).reshape(-1)
 
         # Flatten the tokens
         loss = F.cross_entropy(
             shift_logits.reshape(-1, self.vocab_size)[active_loss],
             # [batch_size*(target_length-1) x vocab_size]
-            target_ids[..., 1:].reshape(-1)[active_loss],
+            active_target[active_loss],
             # [batch_size*(target_length-1) ]  (remove bos_token)
-            ignore_index=-1,
+            ignore_index=tokenizer.pad_token_id,
         )
 
         # return loss, loss * active_loss.sum(), active_loss.sum()
@@ -192,7 +185,7 @@ class Generator(nn.Module):
             source_mask: [batch_size x source_length]
 
         Outputs:
-            [batch_size x max_length] (value: id), padded by self.pad_id
+            [batch_size x max_length] (value: id), padded by pad_token_id
         """
         context, _ = self.get_context(source_ids, source_mask)
         context = context.permute([1, 0, 2]).contiguous()
@@ -203,7 +196,7 @@ class Generator(nn.Module):
 
         # Beam search for every sample
         for i in range(batch_size):
-            beam = Beam(self.beam_size, self.bos_id, self.eos_id, source_ids.device)
+            beam = Beam(self.beam_size, source_ids.device)
             btarget_ids = beam.getCurrentState(source_ids.device)
             # [beam_size x 1]
             ctx = context[:, i: i + 1].repeat(1, self.beam_size, 1)
@@ -252,9 +245,9 @@ class Generator(nn.Module):
             # [beam_size x <=max_length]
 
             best = beam_preds[0]
-            raw = [self.bos_id] + [x.item() for x in best]
+            raw = [tokenizer.bos_token_id] + [x.item() for x in best]
             if len(raw) < self.max_length:
-                raw += [self.eos_id] + [self.pad_id] * \
+                raw += [tokenizer.eos_token_id] + [tokenizer.pad_token_id] * \
                     (self.max_length - len(raw) - 1)
             preds.append(raw)
 
@@ -283,7 +276,7 @@ class Generator(nn.Module):
         batch_size = context.size(0)
 
         target_ids = torch.full(
-            (batch_size, 1), self.bos_id, dtype=torch.int64, device=context.device
+            (batch_size, 1), tokenizer.bos_token_id, dtype=torch.int64, device=context.device
         )
 
         hiddens = []
@@ -386,12 +379,11 @@ class Generator(nn.Module):
         Inputs:
             context: [batch_size x source_length x hidden_size]
             memory_key_padding_mask = (1 - source_mask).bool()
-            target_ids: [batch_size x source_length], generated target by self.predict()
-            target_mask: [batch_size x source_length]
+            target_ids: [batch_size x target_length], generated target by self.predict()
             rewards: [batch_size x source_length]
 
         Outputs:
-             : [batch_size x max_length]
+            loss: (sum of a batch)
         """
         tgt_embeddings = (
             self.encoder.embeddings(target_ids)  # [... x hidden_size]
@@ -431,14 +423,14 @@ class Generator(nn.Module):
         loss = torch.tensor(0.0, device=flat_lm_logits.device)
         for i, vocab in enumerate(flat_lm_logits):
             choice = flat_target_ids[i]
-            if choice != self.pad_id:
+            if choice != tokenizer.pad_token_id:
                 loss += vocab[choice] * flat_rewards[i]
 
         return -loss
 
 
 class Beam(object):
-    def __init__(self, size, sos, eos, device):
+    def __init__(self, size, device):
         self.size = size
         # The score for each translation on the beam.
         self.scores = torch.zeros(size, dtype=torch.float, device=device)
@@ -446,9 +438,8 @@ class Beam(object):
         self.prevKs = []
         # The outputs at each time-step.
         self.nextYs = [torch.zeros(size, dtype=torch.long, device=device)]
-        self.nextYs[0][0] = sos
+        self.nextYs[0][0] = tokenizer.bos_token_id
         # Has EOS topped the beam yet.
-        self._eos = eos
         self.eosTop = False
         # Time and k pair for finished.
         self.finished = []
@@ -484,7 +475,7 @@ class Beam(object):
 
             # Don't let EOS have children.
             for i in range(self.nextYs[-1].size(0)):
-                if self.nextYs[-1][i] == self._eos:
+                if self.nextYs[-1][i] == tokenizer.eos_token_id:
                     beamLk[i] = -1e20
         else:
             beamLk = wordLk[0]
@@ -500,12 +491,12 @@ class Beam(object):
         self.nextYs.append((bestScoresId - prevK * numWords))
 
         for i in range(self.nextYs[-1].size(0)):
-            if self.nextYs[-1][i] == self._eos:
+            if self.nextYs[-1][i] == tokenizer.eos_token_id:
                 s = self.scores[i]
                 self.finished.append((s, len(self.nextYs) - 1, i))
 
         # End condition is when top-of-beam is EOS and no global score.
-        if self.nextYs[-1][0] == self._eos:
+        if self.nextYs[-1][0] == tokenizer.eos_token_id:
             self.eosTop = True
 
     def done(self):
@@ -518,7 +509,7 @@ class Beam(object):
         if len(self.finished) != self.size:
             unfinished = []
             for i in range(self.nextYs[-1].size(0)):
-                if self.nextYs[-1][i] != self._eos:
+                if self.nextYs[-1][i] != tokenizer.eos_token_id:
                     s = self.scores[i]
                     unfinished.append((s, len(self.nextYs) - 1, i))
             unfinished.sort(key=lambda a: -a[0])
@@ -543,7 +534,7 @@ class Beam(object):
         for pred in preds:
             tokens = []
             for tok in pred:
-                if tok == self._eos:
+                if tok == tokenizer.eos_token_id:
                     break
                 tokens.append(tok)
             sentence.append(tokens)
@@ -600,29 +591,28 @@ class Rollout:
                     init_given_num=init_given_num,
                 )
                 with torch.no_grad():
+                    # pred: [0-1] prods
                     pred = self.dis(
-                        source_ids.to(self.dis_device), target_ids.to(
-                            self.dis_device)
+                        source_ids.to(self.dis_device),
+                        target_ids.to(self.dis_device)
                     )
                 # pred = pred.cpu()
                 rewards[init_given_num - 1] += pred
 
             with torch.no_grad():
                 pred = self.dis(
-                    source_ids.to(self.dis_device), pre_target_ids.to(
-                        self.dis_device)
+                    source_ids.to(self.dis_device),
+                    pre_target_ids.to(self.dis_device)
                 )
             # pred = pred.cpu()
             # [batch_size]
             rewards[self.max_length - 1] += pred
 
-        rewards = rewards.permute([1, 0]).contiguous()
         # rewards: [batch_size x max_length]
-
-        rewards = rewards.to(pre_target_mask.device)
+        rewards = rewards.permute([1, 0]).contiguous()
         rewards = rewards * pre_target_mask
         rewards = rewards / (1.0 * rollnum)
-        return rewards
+        return rewards.to(pre_target_mask.device)
 
 
 def Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, **kwargs):
@@ -707,22 +697,18 @@ class Discriminator(nn.Module):
         target_length,
         vocab_size,
         hidden_size,
-        bos_token_id,
-        eos_token_id,
-        pad_token_id,
         device,
         max_filter_size=32,
     ):
         super(Discriminator, self).__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.pad_token_id = pad_token_id
         self.device = device
 
-        self.src_embedding = Embedding(vocab_size, hidden_size, pad_token_id)
-        self.tgt_embedding = Embedding(vocab_size, hidden_size, pad_token_id)
+        self.src_embedding = Embedding(
+            vocab_size, hidden_size, tokenizer.pad_token_id)
+        self.tgt_embedding = Embedding(
+            vocab_size, hidden_size, tokenizer.pad_token_id)
 
         filter_sizes = list(range(1, max_filter_size, 4))
         filter_nums = [100 + i * 10 for i in range(1, max_filter_size, 4)]
