@@ -10,17 +10,15 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.functional import Tensor
-from torch.utils.data import Dataset, TensorDataset, ConcatDataset
+from torch.utils.data import TensorDataset, ConcatDataset
 from tqdm import tqdm, trange
 from pandas.io.parquet import to_parquet
-from typing import List, Sequence
+from typing import List
 from torch.utils.data import (
     DataLoader,
     RandomSampler,
-    SequentialSampler,
     TensorDataset,
     Subset,
-    SubsetRandomSampler,
     ConcatDataset,
 )
 from torch.utils.data.distributed import DistributedSampler
@@ -28,7 +26,6 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 import bleu
 from dataset import CombineDataset, ConstDataset, SelectDataset
 from meter import MinMeter, MaxMeter, AvgMeter, BatchAvgMeter
-from model import Discriminator, Rollout
 import tokenizer
 from tokenizer import str_to_ids, tensors_to_text
 
@@ -71,25 +68,6 @@ def to_pad_features(df, source_length, target_length):
         }
 
     return df.apply(pad_features, axis=1, result_type="expand")
-
-
-def get_target_mask(target_ids: Tensor):
-    """
-    bos, token, eos -> 1
-    pad -> 0
-    """
-    mask = torch.ones_like(target_ids, dtype=torch.int64)
-
-    for i, batch in enumerate(target_ids):
-        try:
-            index_of_eos = (batch == tokenizer.eos_token_id).nonzero()[0]
-        except IndexError:
-            continue
-        mask[i][index_of_eos + 1:] = 0
-
-    target_ids[(1 - mask).bool()] = tokenizer.pad_token_id
-    mask = mask.to(target_ids.device)
-    return target_ids, mask
 
 
 def sample_dataset(df):
@@ -742,6 +720,8 @@ class GanTrainer():
         self.__prepare_optimizer_gen()
         self.__prepare_optimizer_dis()
 
+        self.epoch = -1
+
     def to_gen_device(self, x):
         return x.to(self.gen_device)
 
@@ -772,16 +752,16 @@ class GanTrainer():
     def dis_eval(self):
         self.dis.eval()
 
-    def save_models(self, type: Literal['latest|best_loss|best_bleu'], epoch=0, val=0):
+    def save_models(self, type: Literal['latest|best_loss|best_bleu'], val=0):
         if type == "latest":
             gen_path = self.checkpoints['latest_gen']
             dis_path = self.checkpoints['latest_dis']
         elif type == "best_loss":
-            gen_path = self.checkpoints['best_loss_gen'] % (epoch, val)
-            dis_path = self.checkpoints['best_loss_dis'] % (epoch, val)
+            gen_path = self.checkpoints['best_loss_gen'] % (self.epoch, val)
+            dis_path = self.checkpoints['best_loss_dis'] % (self.epoch, val)
         else:
-            gen_path = self.checkpoints['best_bleu_gen'] % (epoch, val)
-            dis_path = self.checkpoints['best_bleu_dis'] % (epoch, val)
+            gen_path = self.checkpoints['best_bleu_gen'] % (self.epoch, val)
+            dis_path = self.checkpoints['best_bleu_dis'] % (self.epoch, val)
 
         save_model(self._gen, gen_path)
         save_model(self._dis, dis_path)
@@ -866,8 +846,8 @@ class GanTrainer():
             source_ids, source_mask)
         # [batch_size x source_length x args.hidden_size]
 
-        pre_target_ids, _ = self.gen(context, memory_key_padding_mask)
-        pre_target_ids, pre_target_mask = get_target_mask(pre_target_ids)
+        pre_target_ids, pre_target_mask = self.gen(
+            context, memory_key_padding_mask)
         rewards = self.rollout.get_reward(
             source_ids,
             context,
@@ -1032,9 +1012,9 @@ class GanTrainer():
         logging.info("+ GAN batch size = %d", self.args.gan_batch_size)
         logging.info("+ GAN num workers = %d", self.args.gan_num_workers)
 
-        for epoch in trange(self.args.gan_train_epochs, desc="Epoch"):
+        for self.epoch in trange(self.args.gan_train_epochs, desc="Epoch"):
             self.train_epoch(train_dataset, gan_train_dataloader)
-            self.eval_epoch(valid_dataset, bleu_dataset, epoch)
+            self.eval_epoch(valid_dataset, bleu_dataset)
 
     def __prepare_eval(self):
         self.best_loss = MinMeter()
@@ -1047,7 +1027,7 @@ class GanTrainer():
         self.eval_loss(valid_dataset)
         self.eval_bleu(bleu_dataset)
 
-    def eval_epoch(self, valid_dataset, bleu_dataset, epoch):
+    def eval_epoch(self, valid_dataset, bleu_dataset):
         self.dis_to_cpu()
         self.gen_eval()
         self.gen_to_gpu()
@@ -1055,12 +1035,12 @@ class GanTrainer():
         loss = self.eval_loss(valid_dataset)
         if self.best_loss.update(loss) == loss:
             logging.info("+ Best loss !!")
-            self.save_models('best_loss', epoch, self.best_loss.get())
+            self.save_models('best_loss', self.best_loss.get())
 
         dev_bleu = self.eval_bleu(bleu_dataset)
         if self.best_bleu.update(dev_bleu) == dev_bleu:
             logging.info("+ Best bleu !!")
-            self.save_models('best_bleu', epoch, self.best_bleu.get())
+            self.save_models('best_bleu', self.best_bleu.get())
 
     def eval_loss(self, valid_dataset):
         # Eval G with dev dataset
@@ -1079,8 +1059,8 @@ class GanTrainer():
 
         dev_bleu = self.get_bleu(
             bleu_dataset,
-            self.checkpoints["bleu_output"],
-            self.checkpoints["bleu_gold"],
+            self.checkpoints["bleu_output"] % (self.epoch, ),
+            self.checkpoints["bleu_gold"] % (self.epoch, ),
             self.bleu_index,
             self.bleu_gold
         )
@@ -1152,3 +1132,77 @@ class GanTrainer():
         goldMap, predictionMap = bleu.computeMaps(predictions, gan_gold_file)
         dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
         return dev_bleu
+
+
+class Rollout:
+    def __init__(self, gen, dis, max_length):
+        self.gen = gen
+        self.dis = dis
+        self.max_length = max_length
+        self.gen_device = gen.device
+        self.dis_device = dis.device
+
+    def get_reward(
+        self,
+        source_ids,
+        context,
+        memory_key_padding_mask,
+        pre_target_ids,
+        pre_target_mask,
+        rollnum=20,
+    ):
+        """
+        Rollout method:
+            give none(<s>), predict, get reward
+            give pre_target_ids[:1](<s>,a), predict, get reward
+            give pre_target_ids[:2](<s>,a,b), predict, get reward
+            ...
+            give pre_target_ids[:max_length-1], predict, get reward
+        Input:
+            pre_target_ids: [batch_size x target_length], with bos!!
+        Outputs:
+            rewards: [batch_size x max_length]
+                rewards[i][0] is empty
+                rewards[i][j]: the reward of using word Seq[j] as the next of Seq[0..j-1].
+        """
+        batch_size = context.size(0)
+
+        rewards = torch.zeros(
+            self.max_length, batch_size, dtype=torch.float, device=self.dis_device
+        )
+        self.dis.eval()
+        for _ in range(rollnum):  # rollout times, mean() later
+            # ignore bos_token
+            for init_given_num in range(2, self.max_length):
+                if not any(pre_target_mask[:, init_given_num]):
+                    break
+                target_ids, target_mask = self.gen(
+                    context,
+                    memory_key_padding_mask,
+                    target_ids=pre_target_ids,
+                    rollout=True,
+                    init_given_num=init_given_num,
+                )
+                with torch.no_grad():
+                    # pred: [0-1] prods
+                    pred = self.dis(
+                        source_ids.to(self.dis_device),
+                        target_ids.to(self.dis_device)
+                    )
+                # pred = pred.cpu()
+                rewards[init_given_num - 1] += pred
+
+            with torch.no_grad():
+                pred = self.dis(
+                    source_ids.to(self.dis_device),
+                    pre_target_ids.to(self.dis_device)
+                )
+            # pred = pred.cpu()
+            # [batch_size]
+            rewards[self.max_length - 1] += pred
+
+        # rewards: [batch_size x max_length]
+        rewards = rewards.permute([1, 0]).contiguous()
+        rewards = rewards * pre_target_mask
+        rewards = rewards / (1.0 * rollnum)
+        return rewards.to(pre_target_mask.device)
