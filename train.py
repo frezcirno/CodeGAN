@@ -16,7 +16,7 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import TensorDataset
 from helpers import (
-    GanTrainer, is_distributed, is_notebook, remember_result, set_seed, cache_result,
+    DisTrainer, GanTrainer, is_distributed, is_notebook, remember_result, set_seed, cache_result,
     to_features, to_pad_features, series_to_tensor, sample_dataset
 )
 from model import Generator, Discriminator
@@ -389,7 +389,7 @@ Generator: 1995 MiB
 Discriminator: 556 MiB
 Total: 2551 MiB
 """
-if args.do_gen_train or args.do_gen_eval or args.do_dis_train or args.do_gan_train or args.do_gan_eval:
+if args.do_gen_train or args.do_gen_eval or args.do_dis_train or args.do_dis_eval or args.do_gan_train or args.do_gan_eval:
     _gen, gen = build_gen(args, args.gen_load_path,
                           gen_device, args.gen_device_ids)
 
@@ -399,12 +399,21 @@ if args.do_dis_train or args.do_gan_train:
                           dis_device, args.dis_device_ids)
 
 # %%
-gan_train = GanTrainer(args, _gen, gen, _dis,
-                       dis, jd_bleu.index, jd_bleu.redocstring)
+if args.do_dis_train or args.do_dis_eval:
+    dis_train = DisTrainer(args, _dis, dis, _gen)
 
-if args.do_gan_train:
-    gan_train.train(train_dataset, valid_dataset, bleu_dataset)
-elif args.do_gan_eval:
-    gan_train.eval(train_dataset)
+    if args.do_dis_train:
+        dis_train.train(train_dataset, valid_dataset)
+    else:
+        dis_train.eval(valid_dataset)
+
+# %%
+if args.do_gan_train or args.do_gan_eval:
+    gan_train = GanTrainer(args, _gen, gen, _dis,
+                           dis, jd_bleu.index, jd_bleu.redocstring)
+    if args.do_gan_train:
+        gan_train.train(train_dataset, valid_dataset, bleu_dataset)
+    else:
+        gan_train.eval(train_dataset)
 
 # %%
