@@ -182,7 +182,7 @@ def write_output(output_file, gold_file, indexs, predicts, golds):
 
 
 def is_distributed() -> bool:
-    return hasattr(os.environ, "LOCAL_RANK")
+    return os.environ.get("LOCAL_RANK") != None
 
 
 def set_seed(seed=42):
@@ -552,10 +552,11 @@ class GenTrainer():
 
 
 class DisTrainer():
-    def __init__(self, args, _dis, dis):
+    def __init__(self, args, _dis, dis, _gen):
         self.args = args
         self._dis = _dis
         self.dis = dis
+        self._gen = _gen
         self.dis_device = _dis.device
 
         from os.path import join as path_join
@@ -571,11 +572,12 @@ class DisTrainer():
 
         self.best_loss = MinMeter()
 
-    def save_model(self, type: Literal['latest|best_loss']):
+    def save_model(self, type: Literal['latest|best_loss'], loss=0):
         if type == 'latest':
             path = self.checkpoints['dis_last_path']
         else:
-            path = self.checkpoints['dis_best_path']
+            path = self.checkpoints['dis_best_path'] % (self.epoch, loss)
+
         save_model(self._dis, path)
 
     def to_dis_device(self, x):
@@ -594,27 +596,12 @@ class DisTrainer():
             self.dis.parameters(), lr=self.args.dis_learning_rate, eps=self.args.dis_adam_epsilon
         )
 
-    def prepare_data(self, train_dataset, valid_dataset):
-        train_dataset_sub = Subset(
-            train_dataset,
-            range(self.args.dis_fakegen_train_sample)
-        )
-        valid_dataset_sub = Subset(
-            valid_dataset,
-            range(self.args.dis_fakegen_valid_sample)
-        )
-        fake_train_dataset = fakegen(self.args, train_dataset_sub, self._gen)
-        fake_valid_dataset = fakegen(self.args, valid_dataset_sub, self._gen)
-
-        dis_train_dataset = mix_dataset(
-            train_dataset_sub, fake_train_dataset, [0, 2])
-        dis_valid_dataset = mix_dataset(
-            valid_dataset_sub, fake_valid_dataset, [0, 2])
-
-        return dis_train_dataset, dis_valid_dataset
+    def prepare_data(self, dataset, num_samples):
+        dataset_sub = Subset(dataset, range(num_samples))
+        mixed_dataset = fakegen(self.args, dataset_sub, self._gen)
+        return mixed_dataset
 
     def train_epoch(self, dataset):
-
         dataloader = DataLoader(
             dataset,
             batch_size=self.args.dis_batch_size,
@@ -651,19 +638,24 @@ class DisTrainer():
         logging.info("+ Valid dataset = %d", 2 *
                      self.args.dis_fakegen_valid_sample)
 
-        dis_train_dataset, dis_valid_dataset = self.prepare_data(
-            train_dataset, valid_dataset)
+        dis_train_dataset = self.prepare_data(
+            train_dataset, self.args.dis_fakegen_train_sample)
+        dis_valid_dataset = self.prepare_data(
+            valid_dataset, self.args.dis_fakegen_valid_sample)
 
-        for epoch in range(self.args.dis_train_epochs):
+        for self.epoch in range(self.args.dis_train_epochs):
             self.train_epoch(dis_train_dataset)
             self.save_model("latest")
 
             loss = self.eval_epoch(dis_valid_dataset)
             if self.best_loss.update(loss) == loss:
                 logging.info("+ Best loss !!")
-                self.save_model('best_loss', epoch, loss)
+                self.save_model('best_loss', loss)
 
     def eval_epoch(self, dataset):
+        return self.eval_loss(dataset)
+
+    def eval_loss(self, dataset):
         avg_loss_meter = AvgMeter()
         dataloader = DataLoader(
             dataset,
@@ -673,7 +665,7 @@ class DisTrainer():
         )
         self.dis_eval()
         with torch.no_grad():
-            with tqdm(dataloader) as bar:
+            with tqdm(dataloader, "loss 00.0000") as bar:
                 for batch in bar:
                     source_ids = self.to_dis_device(batch[0])
                     target_ids = self.to_dis_device(batch[1])
@@ -686,13 +678,15 @@ class DisTrainer():
                         loss = loss.mean()
                     loss = loss.item()
                     avg_loss = avg_loss_meter.update(loss)
-                    bar.set_description(f"dis eval loss {avg_loss:.2f}")
+                    bar.set_description(f"loss {avg_loss:.4f}")
 
         logging.info("+ eval loss = %f", avg_loss)
         return avg_loss
 
-    def eval(self):
-        pass
+    def eval(self, valid_dataset):
+        dis_valid_dataset = self.prepare_data(
+            valid_dataset, self.args.dis_fakegen_valid_sample)
+        self.eval_loss(dis_valid_dataset)
 
 
 class GanTrainer():
