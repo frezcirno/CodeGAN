@@ -116,34 +116,7 @@ parser.add_argument("--gan_d_batch_size", type=int, default=64)
 parser.add_argument("--gan_d_num_workers", type=int, default=4)
 
 args = parser.parse_args(
-    args=[
-        "--gen_device_ids",
-        "3",
-        "--dis_device_ids",
-        "3",
-        "--gen_load_path",
-        "checkpoints/3.7_2/gan_gen_bestbleu_0_19.490000.bin",
-        "--dis_load_path",
-        "checkpoints/3.7_2/gan_dis_bestbleu_0_19.490000.bin",
-        "--do_gan_train",
-        "--gan_batch_size",
-        "2",
-        "--gan_train_epochs",
-        "4",
-        "--gan_rollnum",
-        "20",
-        "--gan_g_steps",
-        "10",
-        "--gan_teach",
-        "--gan_d_steps",
-        "3",
-        "--gan_d_sample",
-        "200",
-        "--gan_d_epochs",
-        "2",
-        "--gan_d_batch_size",
-        "64",
-    ]
+    args="--gen_load_path checkpoints/3.8_3/gan_gen_bestbleu_0_19.520000.bin --dis_load_path checkpoints/3.8_3/gan_dis_bestbleu_0_19.520000.bin --do_gan_train --gan_teach --gan_train_epochs 10 --gan_batch_size 2 --gan_rollnum 20 --gan_g_step 100 --gan_d_sample 1000 --gan_d_step 10 --gan_d_epochs 10 --fakegen_batch_size 32 --gen_device_ids 3 --dis_device_ids 3 --output_dir 3.16-1".split()
     if is_notebook()
     else sys.argv[1:]
 )
@@ -433,21 +406,5 @@ if args.do_gan_train:
     gan_train.train(train_dataset, valid_dataset, bleu_dataset)
 elif args.do_gan_eval:
     gan_train.eval(train_dataset)
-
-
-# %%
-#import random
-#a = random.randint(1, 10000)
-#sample = dis_train_dataset[a]
-#source_ids = sample[0]
-#target_ids = sample[1]
-#label = sample[-1].item()
-#dis_value = dis(source_ids.unsqueeze(0).to(dis_device), target_ids.unsqueeze(0).to(dis_device)).item()
-#print("Sample:", a)
-#print("Source Text:", tensor_to_text(tokenizer, source_ids))
-#print("Target Text:", tensor_to_text(tokenizer, target_ids))
-#print("Label:", "real" if label else "fake")
-#print("Dis pred:", dis_value)
-
 
 # %%

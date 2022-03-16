@@ -10,6 +10,25 @@ from modeling_roberta import RobertaModel
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 
 
+def get_target_mask(target_ids: Tensor):
+    """
+    bos, token, eos -> 1
+    pad -> 0
+    """
+    mask = torch.ones_like(target_ids, dtype=torch.int64)
+
+    for i, batch in enumerate(target_ids):
+        try:
+            index_of_eos = (batch == tokenizer.eos_token_id).nonzero()[0]
+        except IndexError:
+            continue
+        mask[i][index_of_eos + 1:] = 0
+
+    target_ids[(1 - mask).bool()] = tokenizer.pad_token_id
+    mask = mask.to(target_ids.device)
+    return target_ids, mask
+
+
 class Generator(nn.Module):
     """
         Generator model, robert + transformer
@@ -269,9 +288,8 @@ class Generator(nn.Module):
             memory_key_padding_mask = (1 - source_mask).bool()
 
         Outputs:
-            preds: [batch_size x max_length], with bos
-            hiddens: [batch_size x max_length x vocab_size] (value: probs)
-                the hidden outputs every step
+            target_ids: [batch_size x max_length], with bos
+            target_mask: [batch_size x max_length]
         """
         batch_size = context.size(0)
 
@@ -279,11 +297,10 @@ class Generator(nn.Module):
             (batch_size, 1), tokenizer.bos_token_id, dtype=torch.int64, device=context.device
         )
 
-        hiddens = []
         # has_end = torch.zeros(batch_size, dtype=torch.bool)
         for _ in range(self.max_length - 1):
             # [batch_size x i]
-            attn_mask = self.bias[: target_ids.shape[1], : target_ids.shape[1]]
+            attn_mask = self.bias[: target_ids.size(1), : target_ids.size(1)]
             tgt_embeddings = (
                 self.encoder.embeddings(target_ids)  # [... x hidden_size]
                 .permute([1, 0, 2])
@@ -303,28 +320,13 @@ class Generator(nn.Module):
             out = self.lsm(self.lm_head(hidden_states))
             # [batch_size x vocab_size] (value: probs)
 
-            hiddens.append(out)
             pred = out.argmax(1)  # [batch_size ] (values: id)
             target_ids = torch.cat([target_ids, pred.unsqueeze(1)], 1)
 
-            # has_end = has_end.logical_or(pred.cpu() == self.eos_id)
-            # if all(has_end):
-            #     break
-
-        # Padding to self.max_length, filling zeros
-        # if target_ids.size(1) < self.max_length:
-        #     padding = torch.zeros(
-        #         batch_size,
-        #         self.max_length - target_ids.size(1),
-        #         device=target_ids.device,
-        #     )
-        #     target_ids = torch.cat([target_ids, padding], 1)
-
         # target_ids: [batch_size x max_length]
         # [batch_size x max_length x vocab_size]
-        hiddens = torch.stack(hiddens, dim=1)
 
-        return target_ids, hiddens
+        return get_target_mask(target_ids)
 
     def rollout_predict(
         self, context, memory_key_padding_mask, init_target_ids, init_given_num
@@ -332,7 +334,7 @@ class Generator(nn.Module):
         """
         Predict like self.predict(), but
             1) sampling use multinomial()
-            2) initial input is given rather than eos
+            2) initial input is given rather than bos
 
         Inputs:
             context: [batch_size x source_length x hidden_size]
@@ -340,7 +342,8 @@ class Generator(nn.Module):
             init_target_ids: [batch_size x init_length], generated target by self.predict()
 
         Outputs:
-             : [batch_size x max_length]
+            target_ids: [batch_size x max_length]
+            target_mask: [batch_size x max_length]
         """
         target_ids = init_target_ids[:, :init_given_num]
 
@@ -365,14 +368,13 @@ class Generator(nn.Module):
             out = self.lm_head(out)
             # [batch_size x vocab_size]
 
-            # here: exp() or log()?
-            pred = torch.multinomial(out.exp(), 1)  # sampling one sample
+            pred = torch.multinomial(out.softmax(1), 1)  # sampling one sample
             # [batch_size ]
 
             target_ids = torch.cat([target_ids, pred], 1)
 
         # target_ids: [batch_size x max_length]
-        return target_ids
+        return get_target_mask(target_ids)
 
     def gan_get_loss(self, context, memory_key_padding_mask, target_ids, rewards):
         """
@@ -539,80 +541,6 @@ class Beam(object):
                 tokens.append(tok)
             sentence.append(tokens)
         return sentence
-
-
-class Rollout:
-    def __init__(self, gen, dis, max_length):
-        self.gen = gen
-        self.dis = dis
-        self.max_length = max_length
-        self.gen_device = gen.device
-        self.dis_device = dis.device
-
-    def get_reward(
-        self,
-        source_ids,
-        context,
-        memory_key_padding_mask,
-        pre_target_ids,
-        pre_target_mask,
-        rollnum=20,
-    ):
-        """
-        Rollout method:
-            give none(<s>), predict, get reward
-            give pre_target_ids[:1](<s>,a), predict, get reward
-            give pre_target_ids[:2](<s>,a,b), predict, get reward
-            ...
-            give pre_target_ids[:max_length-1], predict, get reward
-        Input:
-            pre_target_ids: [batch_size x target_length], with bos!!
-        Outputs:
-            rewards: [batch_size x max_length]
-                rewards[i][0] is empty
-                rewards[i][j]: the reward of using word Seq[j] as the next of Seq[0..j-1].
-        """
-        batch_size = context.size(0)
-
-        rewards = torch.zeros(
-            self.max_length, batch_size, dtype=torch.float, device=self.dis_device
-        )
-        self.dis.eval()
-        for _ in range(rollnum):  # rollout times, mean() later
-            # ignore bos_token
-            for init_given_num in range(2, self.max_length):
-                if not any(pre_target_mask[:, init_given_num]):
-                    break
-                target_ids = self.gen(
-                    context,
-                    memory_key_padding_mask,
-                    target_ids=pre_target_ids,
-                    rollout=True,
-                    init_given_num=init_given_num,
-                )
-                with torch.no_grad():
-                    # pred: [0-1] prods
-                    pred = self.dis(
-                        source_ids.to(self.dis_device),
-                        target_ids.to(self.dis_device)
-                    )
-                # pred = pred.cpu()
-                rewards[init_given_num - 1] += pred
-
-            with torch.no_grad():
-                pred = self.dis(
-                    source_ids.to(self.dis_device),
-                    pre_target_ids.to(self.dis_device)
-                )
-            # pred = pred.cpu()
-            # [batch_size]
-            rewards[self.max_length - 1] += pred
-
-        # rewards: [batch_size x max_length]
-        rewards = rewards.permute([1, 0]).contiguous()
-        rewards = rewards * pre_target_mask
-        rewards = rewards / (1.0 * rollnum)
-        return rewards.to(pre_target_mask.device)
 
 
 def Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, **kwargs):
