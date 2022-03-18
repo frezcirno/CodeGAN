@@ -265,6 +265,8 @@ class Generator(nn.Module):
 
             best = beam_preds[0]
             raw = [tokenizer.bos_token_id] + [x.item() for x in best]
+            if len(raw) > self.max_length:
+                raw = raw[:self.max_length]
             if len(raw) < self.max_length:
                 raw += [tokenizer.eos_token_id] + [tokenizer.pad_token_id] * \
                     (self.max_length - len(raw) - 1)
@@ -606,15 +608,12 @@ class Conv2dHub(nn.Module):
     def forward(self, i):
         out = []
         for conv2d in self.module_list:
-            # [batch_size x chan(1) x source_length x hidden_size]
+            # [bat_siz x fil_num x 1 x 1]
             x = conv2d(i).squeeze(-1).squeeze(-1)
-            # [batch_size x filter_num x 1 x 1]
-            x = x.permute(0, 1)
-            # [batch_size x filter_num]
             out.append(x)
 
+        # [bat_siz x fil_sum]
         out = torch.cat(out, dim=1)
-        # [batch_size x filter_sum]
         return out
 
 
@@ -649,7 +648,8 @@ class Discriminator(nn.Module):
         self.tgt_filters = Conv2dHub(
             filter_sizes, filter_nums, hidden_size, target_length)
 
-        self.highway = Highway(filter_sum)
+        self.src_highway = Highway(filter_sum)
+        self.tgt_highway = Highway(filter_sum)
 
         # self.src_drop = nn.Dropout()
         # self.tgt_drop = nn.Dropout()
@@ -674,8 +674,8 @@ class Discriminator(nn.Module):
         tgt_outputs = self.tgt_filters(y)
         # [batch_size x filter_sum]
 
-        src_outputs = self.highway(src_outputs)
-        tgt_outputs = self.highway(tgt_outputs)
+        src_outputs = self.src_highway(src_outputs)
+        tgt_outputs = self.tgt_highway(tgt_outputs)
 
         # src_outputs = self.src_drop(src_outputs)
         # tgt_outputs = self.tgt_drop(tgt_outputs)
@@ -684,8 +684,7 @@ class Discriminator(nn.Module):
         src_tgt = torch.cat([src_outputs, tgt_outputs], dim=1)
         # [batch_size x filter_sum*2]
 
-        # Get scores [0-1]
+        # [batch_size], Get scores [0-1]
         logits = self.hidden2out(src_tgt).squeeze(1)
-        # [batch_size]
         scores = torch.sigmoid(logits)
         return scores

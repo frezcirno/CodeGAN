@@ -1,6 +1,12 @@
 from torch import Tensor
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, Subset
 from typing import Sequence
+
+
+def SamplingSubset(dataset: Dataset, num_samples: int) -> Dataset:
+    indices = torch.randperm(len(dataset))[:num_samples]
+    return Subset(dataset, indices)
 
 
 class SelectDataset(Dataset):
