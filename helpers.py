@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.functional import Tensor
 from torch.utils.data import TensorDataset, ConcatDataset
@@ -17,15 +18,17 @@ from typing import List
 from torch.utils.data import (
     DataLoader,
     RandomSampler,
+    SubsetRandomSampler,
     TensorDataset,
     Subset,
     ConcatDataset,
+    SequentialSampler
 )
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AdamW, get_linear_schedule_with_warmup
 import bleu
-from dataset import CombineDataset, ConstDataset, SelectDataset
-from meter import MinMeter, MaxMeter, AvgMeter, BatchAvgMeter
+from dataset import CombineDataset, ConstDataset, SamplingSubset, SelectDataset
+from meter import MinMeter, MaxMeter, AvgMeter, BatchAvgMeter, SumMeter
 import tokenizer
 from tokenizer import str_to_ids, tensors_to_text
 
@@ -158,7 +161,7 @@ def cache_result(path: str, format="parquet"):
 
 
 def save_model(model, path):
-    if hasattr(os.environ, "LOCAL_RANK") and os.environ["LOCAL_RANK"] != 0:
+    if is_distributed() and not is_master():
         return
 
     # Only save the model it-self
@@ -181,8 +184,28 @@ def write_output(output_file, gold_file, indexs, predicts, golds):
     return predictions
 
 
+def env_get(key: str) -> str:
+    return os.environ.get(key)
+
+
 def is_distributed() -> bool:
     return os.environ.get("LOCAL_RANK") != None
+
+
+def local_rank() -> int:
+    return int(env_get("LOCAL_RANK"))
+
+
+def rank() -> int:
+    return int(env_get("RANK"))
+
+
+def world_size() -> int:
+    return int(env_get("WORLD_SIZE"))
+
+
+def is_master() -> bool:
+    return os.environ.get("LOCAL_RANK") == "0"
 
 
 def set_seed(seed=42):
@@ -194,7 +217,7 @@ def set_seed(seed=42):
     # torch.backends.cudnn.deterministic = True
 
 
-def make_fake_dataset2(_gen, dataloader):
+def make_gan_dataset(_gen, dataloader) -> TensorDataset:
     all_source_ids = []
     all_target_ids = []
     all_labels = []
@@ -298,25 +321,148 @@ def is_notebook():
         return False  # Probably standard Python interpreter
 
 
-def fakegen(args, dataset, _gen):
+def fakegen(args, dataset, num_samples, _gen, train=True):
     '''when in distributed, every process will generate and return a part of the mixed data'''
-    if is_distributed():
-        sampler = DistributedSampler(dataset)
+    if train:
+        if is_distributed():
+            indices = torch.randperm(len(dataset))[:num_samples]
+            subset = Subset(dataset, indices)
+            sampler = DistributedSampler(subset, shuffle=True)
+        else:
+            indices = torch.randperm(len(dataset))[:num_samples]
+            sampler = SubsetRandomSampler(indices)
     else:
-        sampler = RandomSampler(dataset)
-
-    if not args.fakegen_batch_size:
-        args.fakegen_batch_size = 64 * 3
+        sampler = SequentialSampler(dataset)
 
     dataloader = DataLoader(
         dataset,
         batch_size=args.fakegen_batch_size,
-        num_workers=args.fakegen_num_workers,
+        num_workers=args.num_workers,
         pin_memory=True,
         sampler=sampler,
     )
+    logging.info("+ Gen fake: batch_size = %d, samples ~= %d",
+                 args.fakegen_batch_size, args.fakegen_batch_size * len(dataloader))
 
-    return make_fake_dataset2(_gen, dataloader)
+    return make_gan_dataset(_gen, dataloader)
+
+
+def eval_gen_bleu(args, _gen, bleu_dataset, gan_output_file, gan_gold_file, indices, gold):
+    gen_device = _gen.device
+    dataloader = DataLoader(
+        bleu_dataset,
+        batch_size=args.eval_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    predicts = []
+    for batch in tqdm(dataloader, "bleu"):
+        source_ids = batch[0]
+        source_mask = batch[1]
+        with torch.no_grad():
+            preds = _gen.beam_predict(source_ids.to(gen_device),
+                                      source_mask.to(gen_device))
+            predicts += tensors_to_text(preds)
+
+    predictions = write_output(
+        gan_output_file,
+        gan_gold_file,
+        indices,
+        predicts,
+        gold,
+    )
+
+    goldMap, predictionMap = bleu.computeMaps(predictions, gan_gold_file)
+    return bleu.bleuFromMaps(goldMap, predictionMap)[0]
+
+
+def eval_gen_loss(args, _gen, gen, valid_dataset):
+    gen_device = _gen.device
+    gen_valid_dataloader = DataLoader(
+        valid_dataset,
+        batch_size=args.eval_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    avg_meter = BatchAvgMeter()
+    for batch in tqdm(gen_valid_dataloader, "eval"):
+        source_ids = batch[0].to(gen_device)
+        source_mask = batch[1].to(gen_device)
+        target_ids = batch[2].to(gen_device)
+        target_mask = batch[3].to(gen_device)
+
+        with torch.no_grad():
+            context, memory_key_padding_mask = _gen.get_context(
+                source_ids, source_mask
+            )
+            # [batch_size x source_length x args.hidden_size]
+
+            loss, num, _ = gen(
+                context, memory_key_padding_mask, target_ids, target_mask
+            )
+            loss *= num
+            if loss.size():
+                num = num.sum()
+                loss = loss.sum()
+
+        eval_loss = avg_meter.update(loss.item(), num.item())
+
+    return eval_loss
+
+
+def eval_dis_loss(args, dis, dataset):
+    dis_device = dis.device
+    loss_meter = BatchAvgMeter()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.dis_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    with torch.no_grad():
+        with tqdm(dataloader, "BCEloss 00.0000") as bar:
+            for batch in bar:
+                source_ids = batch[0].to(dis_device)
+                target_ids = batch[1].to(dis_device)
+                labels = batch[2].to(dis_device)
+
+                prob = dis(source_ids, target_ids)
+                loss = F.binary_cross_entropy(prob, labels, reduction='sum')
+                # mean() to average on multi-gpu
+                if loss.size():
+                    loss = loss.mean()
+
+                avg_loss = loss_meter.update(loss.item(), labels.size(0))
+                bar.set_description(f"BCEloss {avg_loss:.4f}")
+
+    return avg_loss
+
+
+def eval_dis_acc(args, dis, dataset):
+    dis_device = dis.device
+    acc_meter = BatchAvgMeter()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.dis_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    with torch.no_grad():
+        with tqdm(dataloader, "Accu 00.0000") as bar:
+            for batch in bar:
+                source_ids = batch[0].to(dis_device)
+                target_ids = batch[1].to(dis_device)
+                labels = batch[2]
+
+                prob = dis(source_ids, target_ids).to("cpu").gt(0.5)
+
+                right = labels.eq(prob).sum()
+                total = source_ids.size(0)
+
+                acc = acc_meter.update(right, total)
+                bar.set_description(f"Accu {acc:.4f}")
+    return acc
 
 
 class GenTrainer():
@@ -382,14 +528,10 @@ class GenTrainer():
 
         logging.info("checkpoints: %s", self.checkpoints)
 
-    def save_models(self, type: Literal['latest|best_loss|best_bleu'], epoch=0, val=0):
-        if type == "latest":
-            path = self.checkpoints['latest']
-        elif type == "best_loss":
-            path = self.checkpoints['best_loss'] % (epoch, val)
-        else:
-            path = self.checkpoints['best_bleu'] % (epoch, val)
-
+    def save_checkpoint(self, type: Literal['latest|best_loss|best_bleu'], *args):
+        path = self.checkpoints[type]
+        if args:
+            path = path % args
         save_model(self._gen, path)
 
     def prepare_scheduler(self, train_dataset):
@@ -406,15 +548,15 @@ class GenTrainer():
     def train_epoch(self, train_dataset):
         self.prepare_scheduler(train_dataset)
 
-        if not is_distributed():
-            gen_train_sampler = RandomSampler(train_dataset)
+        if is_distributed():
+            gen_train_sampler = DistributedSampler(train_dataset, shuffle=True)
         else:
-            gen_train_sampler = DistributedSampler(train_dataset)
+            gen_train_sampler = RandomSampler(train_dataset)
 
         gen_train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.args.gen_batch_size,
-            num_workers=self.args.gen_num_workers,
+            num_workers=self.args.num_workers,
             pin_memory=True,
             sampler=gen_train_sampler,
         )
@@ -447,108 +589,52 @@ class GenTrainer():
                 avg_loss = avg_meter.update(loss.item(), num.item())
                 train_bar.set_description(f"loss {avg_loss:.2f}")
 
-        self.save_models('latest')
+        self.save_checkpoint('latest', self.epoch)
 
     def train(self, train_dataset, valid_dataset, bleu_dataset):
         # Start training
         logging.info("Do train generator:")
-        logging.info("+ Num examples = %d", len(train_dataset))
+        logging.info("+ train_dataset = %d", len(train_dataset))
         logging.info("+ Batch size = %d", self.args.gen_batch_size)
         logging.info("+ Train epochs = %d", self.args.gen_train_epochs)
         logging.info("+ Learning rate = %e", self.args.gen_learning_rate)
         logging.info("+ Adam epsilon = %e", self.args.gen_adam_epsilon)
-        logging.info("+ Distributed workers = %d", self.args.gen_num_workers)
 
-        for epoch in range(self.args.gen_train_epochs):
+        for self.epoch in range(self.args.gen_train_epochs):
             self.train_epoch(train_dataset)
-            self.eval_epoch(valid_dataset, bleu_dataset, epoch)
+            self.eval_epoch(valid_dataset, bleu_dataset)
 
-    def eval_loss(self, valid_dataset):
-        gen_valid_dataloader = DataLoader(
-            valid_dataset,
-            batch_size=self.args.eval_batch_size,
-            num_workers=self.args.gen_num_workers,
-            pin_memory=True,
-        )
+    def eval(self, valid_dataset, bleu_dataset):
+        loss = self.eval_loss(valid_dataset)
+        logging.info(f"+ Eval loss: {loss:.5f}")
+        dev_bleu = self.eval_bleu(bleu_dataset)
+        logging.info("+ bleu-4 = %f", dev_bleu)
 
-        # Start Evaling model
-        # Save best checkpoint for best ppl
-        self.gen_eval()
-        avg_meter = BatchAvgMeter()
-        for batch in tqdm(gen_valid_dataloader, "eval"):
-            source_ids = self.to_gen_device(batch[0])
-            source_mask = self.to_gen_device(batch[1])
-            target_ids = self.to_gen_device(batch[2])
-            target_mask = self.to_gen_device(batch[3])
-
-            with torch.no_grad():
-                context, memory_key_padding_mask = self._gen.get_context(
-                    source_ids, source_mask
-                )
-                # [batch_size x source_length x args.hidden_size]
-
-                loss, num, _ = self.gen(
-                    context, memory_key_padding_mask, target_ids, target_mask
-                )
-                loss *= num
-                if loss.size():
-                    num = num.sum()
-                    loss = loss.sum()
-
-            eval_loss = avg_meter.update(loss.item(), num.item())
-
-        return eval_loss
-
-    def eval_epoch(self, valid_dataset, bleu_dataset, epoch):
+    def eval_epoch(self, valid_dataset, bleu_dataset):
         loss = self.eval_loss(valid_dataset)
         logging.info(f"+ Eval loss: {loss:.5f}")
         if self.best_loss.update(loss) == loss:
-            self.save_models('best_loss', epoch, loss)
+            self.save_checkpoint('best_loss', self.epoch, loss)
 
-        dev_bleu = self.eval_bleu(
+        dev_bleu = self.eval_bleu(bleu_dataset)
+        logging.info("+ bleu-4 = %f", dev_bleu)
+        if self.best_bleu.update(dev_bleu) == dev_bleu:
+            self.save_checkpoint('best_bleu', self.epoch, dev_bleu)
+
+    def eval_loss(self, valid_dataset):
+        self.gen_eval()
+        return eval_gen_loss(self.args, self._gen, self.gen, valid_dataset)
+
+    def eval_bleu(self, bleu_dataset):
+        return eval_gen_bleu(
+            self.args,
+            self._gen,
             bleu_dataset,
             self.checkpoints["bleu_output"],
             self.checkpoints["bleu_gold"],
             self.bleu_index,
-            self.bleu_gold
+            self.bleu_gold,
         )
-        logging.info("+ bleu-4 = %f", dev_bleu)
-        if self.best_bleu.update(dev_bleu) == dev_bleu:
-            self.save_models('best_bleu', epoch, dev_bleu)
-
-    def eval_bleu(self, bleu_dataset, gan_output_file, gan_gold_file, indices, gold):
-        # Save best checkpoint for best bleu
-        logging.info("Calculate bleu-4:")
-        logging.info("+ gan_output_file = %s", gan_output_file)
-        logging.info("+ gan_gold_file = %s", gan_gold_file)
-
-        dataloader = DataLoader(
-            bleu_dataset,
-            batch_size=self.args.eval_batch_size,
-            num_workers=self.args.gan_num_workers,
-            pin_memory=True,
-        )
-        predicts = []
-        for batch in tqdm(dataloader, "bleu"):
-            source_ids = batch[0]
-            source_mask = batch[1]
-            with torch.no_grad():
-                preds = self._gen.beam_predict(
-                    source_ids.to(self.gen_device),
-                    source_mask.to(self.gen_device))
-                predicts += tensors_to_text(preds)
-
-        predictions = write_output(
-            gan_output_file,
-            gan_gold_file,
-            indices,
-            predicts,
-            gold,
-        )
-
-        goldMap, predictionMap = bleu.computeMaps(predictions, gan_gold_file)
-        dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
-        return dev_bleu
 
 
 class DisTrainer():
@@ -562,19 +648,21 @@ class DisTrainer():
         from os.path import join as path_join
         self.checkpoints = {
             "dis_last_path": path_join(args.output_dir, "dis.bin"),
-            "dis_best_path": path_join(args.output_dir, "dis_bestloss_%d_%f.bin")
+            "dis_best_path": path_join(args.output_dir, "dis_bestloss_%d_%f.bin"),
+            "dis_best_acc": path_join(args.output_dir, "dis_bestacc_%d_%f.bin"),
         }
         logging.info("checkpoint paths: %s", self.checkpoints)
 
         self.__prepare_optimizer()
 
-        logging.info("+ dis_batch_size = %s", args.dis_batch_size)
-
         self.best_loss = MinMeter()
+        self.best_acc = MaxMeter()
 
-    def save_model(self, type: Literal['latest|best_loss'], loss=0):
+    def save_model(self, type: Literal['latest|best_acc|best_loss'], loss=0):
         if type == 'latest':
             path = self.checkpoints['dis_last_path']
+        elif type == 'best_acc':
+            path = self.checkpoints['dis_best_acc'] % (self.epoch, loss)
         else:
             path = self.checkpoints['dis_best_path'] % (self.epoch, loss)
 
@@ -596,97 +684,93 @@ class DisTrainer():
             self.dis.parameters(), lr=self.args.dis_learning_rate, eps=self.args.dis_adam_epsilon
         )
 
-    def prepare_data(self, dataset, num_samples):
-        dataset_sub = Subset(dataset, range(num_samples))
-        mixed_dataset = fakegen(self.args, dataset_sub, self._gen)
+    def prepare_data(self, dataset, num_samples, train=True, shuffle=False):
+        logging.info("+ %s subset: %d -> %d(*2) %s",
+                     "train" if train else "eval", len(dataset), num_samples, "shuffle" if shuffle else "")
+        mixed_dataset = fakegen(self.args, dataset, self._gen, train)
         return mixed_dataset
 
-    def train_epoch(self, dataset):
+    def train_epoch(self, dis_train_dataset):
+        loss_meter = BatchAvgMeter()
         dataloader = DataLoader(
-            dataset,
+            dis_train_dataset,
             batch_size=self.args.dis_batch_size,
-            num_workers=self.args.dis_num_workers,
+            shuffle=True,
+            num_workers=self.args.num_workers,
             pin_memory=True,
         )
-
+        logging.info("+ train batch size = %d", self.args.dis_batch_size)
         self.dis_train()
-        with tqdm(dataloader) as bar:
+        with tqdm(dataloader, "BCEloss 00.0000") as bar:
             for batch in bar:
                 source_ids = self.to_dis_device(batch[0])
                 target_ids = self.to_dis_device(batch[1])
                 labels = self.to_dis_device(batch[2])
 
-                pred = self.dis(source_ids, target_ids)
-                loss = F.binary_cross_entropy(pred, labels)
+                prob = self.dis(source_ids, target_ids)
+                loss = F.binary_cross_entropy(prob, labels, reduction='sum')
                 # mean() to average on multi-gpu
                 if loss.size():
                     loss = loss.mean()
-                bar.set_description(f"loss {loss.item():.2f}")
 
                 loss.backward()
                 self.d_opt.step()
                 self.d_opt.zero_grad()
 
+                avg_loss = loss_meter.update(loss.item(), labels.size(0))
+                bar.set_description(f"BCEloss {avg_loss:.4f}")
+
     def train(self, train_dataset, valid_dataset):
         logging.info("Do discriminator train:")
-        logging.info("+ generate train sample = %d",
-                     self.args.dis_fakegen_train_sample)
-        logging.info("+ generate valid sample = %d",
-                     self.args.dis_fakegen_valid_sample)
-        logging.info("+ Train dataset = %d", 2 *
-                     self.args.dis_fakegen_train_sample)
-        logging.info("+ Valid dataset = %d", 2 *
-                     self.args.dis_fakegen_valid_sample)
+        logging.info("+ train_dataset = %d", len(train_dataset))
+        logging.info("+ valid_dataset = %d", len(valid_dataset))
 
-        dis_train_dataset = self.prepare_data(
-            train_dataset, self.args.dis_fakegen_train_sample)
         dis_valid_dataset = self.prepare_data(
-            valid_dataset, self.args.dis_fakegen_valid_sample)
+            valid_dataset, self.args.dis_fakegen_valid_sample, False, shuffle=True)
 
         for self.epoch in range(self.args.dis_train_epochs):
+            # change dataset per X epochs
+            if self.epoch % 10 == 0:
+                dis_train_dataset = self.prepare_data(
+                    train_dataset,
+                    self.args.dis_fakegen_train_sample,
+                    shuffle=True
+                )
+
             self.train_epoch(dis_train_dataset)
             self.save_model("latest")
 
-            loss = self.eval_epoch(dis_valid_dataset)
+            loss = self.eval_loss(dis_valid_dataset)
             if self.best_loss.update(loss) == loss:
                 logging.info("+ Best loss !!")
                 self.save_model('best_loss', loss)
 
-    def eval_epoch(self, dataset):
-        return self.eval_loss(dataset)
+            acc = self.eval_acc(dis_valid_dataset)
+            if self.best_acc.update(acc) == acc:
+                logging.info("+ Best acc !!")
+                self.save_model('best_acc', acc)
 
     def eval_loss(self, dataset):
-        avg_loss_meter = AvgMeter()
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.args.dis_batch_size,
-            num_workers=self.args.dis_num_workers,
-            pin_memory=True,
-        )
         self.dis_eval()
-        with torch.no_grad():
-            with tqdm(dataloader, "loss 00.0000") as bar:
-                for batch in bar:
-                    source_ids = self.to_dis_device(batch[0])
-                    target_ids = self.to_dis_device(batch[1])
-                    labels = self.to_dis_device(batch[2])
-
-                    prob = self.dis(source_ids, target_ids)
-                    loss = F.binary_cross_entropy(prob, labels)
-                    # mean() to average on multi-gpu
-                    if loss.size():
-                        loss = loss.mean()
-                    loss = loss.item()
-                    avg_loss = avg_loss_meter.update(loss)
-                    bar.set_description(f"loss {avg_loss:.4f}")
-
-        logging.info("+ eval loss = %f", avg_loss)
+        avg_loss = eval_dis_loss(self.args, self.dis, dataset)
+        logging.info("+ BCEloss = %f", avg_loss)
         return avg_loss
+
+    def eval_acc(self, dataset):
+        self.dis_eval()
+        acc = eval_dis_acc(self.args, self.dis, dataset)
+        logging.info("+ Accu = %f", acc)
+        return acc
 
     def eval(self, valid_dataset):
         dis_valid_dataset = self.prepare_data(
-            valid_dataset, self.args.dis_fakegen_valid_sample)
+            valid_dataset,
+            self.args.dis_fakegen_valid_sample,
+            train=False,
+            shuffle=True
+        )
         self.eval_loss(dis_valid_dataset)
+        self.eval_acc(dis_valid_dataset)
 
 
 class GanTrainer():
@@ -892,35 +976,37 @@ class GanTrainer():
         dataloader = DataLoader(
             dis_train_dataset,
             batch_size=self.args.gan_d_batch_size,
-            num_workers=self.args.gan_d_num_workers,
+            shuffle=True,
+            num_workers=self.args.num_workers,
             pin_memory=True,
         )
 
         # Train dis for k epochs
         for d_epoch in trange(self.args.gan_d_epochs, desc="d-step epoch"):
-            d_loss = AvgMeter()
-            with tqdm(dataloader, "loss 0.0000") as bar:
+            loss_meter = BatchAvgMeter()
+            with tqdm(dataloader, "BCEloss 0.0000") as bar:
                 for batch in bar:
                     source_ids = self.to_dis_device(batch[0])
                     target_ids = self.to_dis_device(batch[1])
-                    label = self.to_dis_device(batch[2])
+                    labels = self.to_dis_device(batch[2])
 
-                    pred = self.dis(source_ids, target_ids)
-                    loss = F.binary_cross_entropy(pred, label)
+                    prob = self.dis(source_ids, target_ids)
+                    loss = F.binary_cross_entropy(
+                        prob, labels, reduction='sum')
+                    # mean() to average on multi-gpu
                     if loss.size():
-                        loss = loss.mean()  # mean() to average on multi-gpu
+                        loss = loss.mean()
 
                     loss.backward()
                     self.d_opt.step()
                     self.d_opt.zero_grad()
 
-                    loss = loss.item()
-                    d_loss_avg = d_loss.update(loss)
-                    bar.set_description(f"loss {d_loss_avg:.4f}")
+                    d_loss_avg = loss_meter.update(loss.item(), labels.size(0))
+                    bar.set_description(f"BCEloss {d_loss_avg:.4f}")
 
-            logging.info("d-epoch train loss %f", d_loss_avg)
+            logging.info("d-epoch train BCEloss %f", d_loss_avg)
 
-    def train_epoch_gen(self, dataloader):
+    def train_epoch_gen(self, train_iter):
         # G-steps
         self.gen_to_gpu()
         self.gen_train()
@@ -928,7 +1014,6 @@ class GanTrainer():
         self.dis_eval()
         g_loss = BatchAvgMeter()
         g_tloss = BatchAvgMeter()
-        train_iter = iter(dataloader)
         with trange(self.args.gan_g_steps, desc="g-step 00.0000 00.0000") as g_step_bar:
             g_step = iter(g_step_bar)
             while True:
@@ -956,26 +1041,41 @@ class GanTrainer():
             logging.info("g-step train avg loss: %f",
                          (g_loss_avg + g_tloss_avg) / 2)
 
-    def train_epoch_dis(self, train_dataset):
+    def sample_for_dis(self, train_subset):
+        '''
+        Notice: The order of the return dataset is equal to the train_subset,
+        as shuffle is used in train_step_dis(), so not shuffle here.
+        '''
+        if is_distributed():
+            sampler = DistributedSampler(train_subset)
+        else:
+            sampler = SequentialSampler(train_subset)
+
+        dataloader = DataLoader(
+            train_subset,
+            batch_size=self.args.fakegen_batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            sampler=sampler,
+        )
+
+        logging.info("+ Gen fake: batch_size = %d, samples ~= %d",
+                     self.args.fakegen_batch_size, self.args.fakegen_batch_size * len(dataloader))
+        return make_gan_dataset(self._gen, dataloader)
+
+    def train_epoch_dis(self, train_subset):
         # D-steps
         self.gen_eval()
         self.dis_train()
         for d_step in trange(self.args.gan_d_steps, desc="d-step"):
             # (re)generate fake dataset
             self.gen_to_gpu()
-            indices = torch.randperm(self.args.gan_d_sample)
-            subset = Subset(train_dataset, indices)
-            dis_train_dataset = fakegen(self.args, subset, self._gen)
+            dis_train_dataset = self.sample_for_dis(train_subset)
             self.gen_to_cpu()
 
             self.dis_to_gpu()
             self.train_step_dis(dis_train_dataset)
             self.dis_to_cpu()
-
-    def train_epoch(self, train_dataset, train_dataloader):
-        self.train_epoch_gen(train_dataloader)
-        self.train_epoch_dis(train_dataset)
-        self.save_models('latest')
 
     def train(self, train_dataset, valid_dataset, bleu_dataset):
         logging.info("Do GAN train:")
@@ -990,24 +1090,39 @@ class GanTrainer():
         logging.info("+ d-sample = %d", self.args.gan_d_sample)
         logging.info("+ d-epochs = %d", self.args.gan_d_epochs)
         logging.info("+ Rollout num = %d", self.args.gan_rollnum)
+        logging.info("+ GAN batch size = %d", self.args.gan_batch_size)
 
+        '''
+        Change data for pg train every epoch.
+        '''
         if is_distributed():
-            gan_train_sampler = DistributedSampler(train_dataset)
+            gan_train_sampler = DistributedSampler(train_dataset, shuffle=True)
         else:
             gan_train_sampler = RandomSampler(train_dataset)
 
-        gan_train_dataloader = DataLoader(
+        gan_dataloader = DataLoader(
             train_dataset,
             batch_size=self.args.gan_batch_size,
-            num_workers=self.args.gan_num_workers,
+            num_workers=self.args.num_workers,
             pin_memory=True,
             sampler=gan_train_sampler,
         )
-        logging.info("+ GAN batch size = %d", self.args.gan_batch_size)
-        logging.info("+ GAN num workers = %d", self.args.gan_num_workers)
+        gan_train_iter = iter(gan_dataloader)
+
+        '''
+        In theory, the whole dataset should be used to train the discriminator,
+        but that's very slow. So a subset is used. The subset won't change
+        with d-step.
+        '''
+        train_subset = SamplingSubset(train_dataset, self.args.gan_d_sample)
 
         for self.epoch in trange(self.args.gan_train_epochs, desc="Epoch"):
-            self.train_epoch(train_dataset, gan_train_dataloader)
+            # Not need, because one epoch here doesn't exhaust all samples
+            # if is_distributed():
+            #     gan_train_sampler.set_epoch(self.epoch)
+            self.train_epoch_gen(gan_train_iter)
+            self.train_epoch_dis(train_subset)
+            self.save_models('latest')
             self.eval_epoch(valid_dataset, bleu_dataset)
 
     def __prepare_eval(self):
@@ -1020,6 +1135,30 @@ class GanTrainer():
         self.gen_to_gpu()
         self.eval_loss(valid_dataset)
         self.eval_bleu(bleu_dataset)
+
+    def eval_dis_acc(self, dataset):
+        acc_meter = BatchAvgMeter()
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.args.dis_batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+        )
+        self.dis_eval()
+        with torch.no_grad():
+            with tqdm(dataloader, "Accu 00.0000") as bar:
+                for batch in bar:
+                    source_ids = self.to_dis_device(batch[0])
+                    target_ids = self.to_dis_device(batch[1])
+                    labels = batch[2]
+                    prob = self.dis(source_ids, target_ids).to("cpu").gt(0.5)
+                    right = labels.eq(prob).sum()
+                    total = source_ids.size(0)
+                    acc = acc_meter.update(right, total)
+                    bar.set_description(f"Accu {acc:.4f}")
+
+        logging.info("+ eval acc = %f", acc)
+        return acc
 
     def eval_epoch(self, valid_dataset, bleu_dataset):
         self.dis_to_cpu()
@@ -1040,7 +1179,7 @@ class GanTrainer():
         # Eval G with dev dataset
         logging.info("+ Valid dataset = %d", len(valid_dataset))
         logging.info("+ batch size = %d", self.args.eval_batch_size)
-        logging.info("+ num workers = %d", self.args.gan_num_workers)
+        logging.info("+ num workers = %d", self.args.num_workers)
 
         loss = self.get_loss(valid_dataset)
         logging.info("+ eval loss = %f", loss)
@@ -1049,7 +1188,7 @@ class GanTrainer():
     def eval_bleu(self, bleu_dataset):
         logging.info("+ Bleu dataset = %d", len(bleu_dataset))
         logging.info("+ batch size = %d", self.args.eval_batch_size)
-        logging.info("+ num workers = %d", self.args.gan_num_workers)
+        logging.info("+ num workers = %d", self.args.num_workers)
 
         dev_bleu = self.get_bleu(
             bleu_dataset,
@@ -1066,7 +1205,7 @@ class GanTrainer():
         gan_valid_dataloader = DataLoader(
             valid_dataset,
             batch_size=self.args.eval_batch_size,
-            num_workers=self.args.gan_num_workers,
+            num_workers=self.args.num_workers,
             pin_memory=True,
         )
 
@@ -1102,7 +1241,7 @@ class GanTrainer():
         gan_valid_dataloader_bleu = DataLoader(
             bleu_dataset,
             batch_size=self.args.eval_batch_size,
-            num_workers=self.args.gan_num_workers,
+            num_workers=self.args.num_workers,
             pin_memory=True,
         )
         predicts = []

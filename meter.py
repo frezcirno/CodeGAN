@@ -39,10 +39,12 @@ class MinMeter(FoldableMeter):
         super().__init__(min, 1e6)
 
 
-class AvgMeter(FoldableMeter):
+class SumMeter(FoldableMeter):
     def __init__(self):
         super().__init__(sum, 0)
 
+
+class AvgMeter(SumMeter):
     def get(self):
         return super().get() / len(self)
 
