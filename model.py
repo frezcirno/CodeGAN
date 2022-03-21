@@ -51,9 +51,7 @@ class Generator(nn.Module):
     ):
         super(Generator, self).__init__()
         self.encoder = RobertaModel.from_pretrained("microsoft/codebert-base")
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=hidden_size, nhead=12), num_layers=6,
-        )
+        self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=hidden_size, nhead=12), num_layers=6,)
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.beam_size = beam_size
@@ -65,9 +63,7 @@ class Generator(nn.Module):
         # [[0,   -1e4, -1e4],
         #  [0,    0,   -1e4],
         #  [0,    0,   0   ]]
-        self.register_buffer(
-            "bias", torch.triu(torch.full((2048, 2048), -1e4), diagonal=1)
-        )
+        self.register_buffer("bias", torch.triu(torch.full((2048, 2048), -1e4), diagonal=1))
 
         self.dense = nn.Linear(hidden_size, hidden_size)
 
@@ -101,7 +97,7 @@ class Generator(nn.Module):
 
         memory_key_padding_mask = (1 - source_mask).bool()
 
-        return context["last_hidden_state"], memory_key_padding_mask
+        return context, memory_key_padding_mask
 
     def forward(
         self,
