@@ -400,16 +400,20 @@ class RobertaModel(RobertaPreTrainedModel):
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
     ):
-        input_shape = input_ids.size()
-
-        device = input_ids.device
-
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape, device)
+        extended_attention_mask = attention_mask[:, None, None, :]
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embeddings(input_ids)
         encoder_outputs = self.encoder(

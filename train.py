@@ -16,9 +16,8 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import TensorDataset
 from helpers import (
-    DisTrainer, GanTrainer, GenTrainer, is_distributed, is_notebook, local_rank, rank, remember_result, set_seed, cache_result,
-    to_features, to_pad_features, series_to_tensor, sample_dataset, world_size
-)
+    DisTrainer, GanTrainer, GenTrainer, is_distributed, is_notebook, local_rank, rank, remember_result, set_seed,
+    cache_result, to_features, to_pad_features, series_to_tensor, sample_dataset, world_size)
 from memory import occupy_mem
 from model import Generator, Discriminator
 import tokenizer
@@ -79,8 +78,8 @@ parser.add_argument("--beam_size", type=int, default=10)
 # Dis
 parser.add_argument("--do_dis_train", action="store_true")
 parser.add_argument("--do_dis_eval", action="store_true")
-parser.add_argument("--dis_fakegen_train_sample", type=int, default=5000)
-parser.add_argument("--dis_fakegen_valid_sample", type=int, default=1000)
+parser.add_argument("--dis_train_sample", type=int, default=5000)
+parser.add_argument("--dis_valid_sample", type=int, default=1000)
 parser.add_argument("--fakegen_batch_size", type=int, default=64)
 parser.add_argument(
     "--dis_load_path", help="The path to the discriminator model",
@@ -94,7 +93,7 @@ parser.add_argument("--dis_early_stop_loss", default=1e-5)
 # Gan
 parser.add_argument("--do_gan_train", action="store_true")
 parser.add_argument("--do_gan_eval", action="store_true")
-parser.add_argument("--gan_batch_size", type=int)
+parser.add_argument("--gan_batch_size", type=int, default=16)
 parser.add_argument("--gan_train_epochs", type=int, default=30)
 parser.add_argument("--gan_rollnum", type=int, default=20)
 parser.add_argument("--gan_g_steps", type=int, default=100,
@@ -104,12 +103,12 @@ parser.add_argument("--gan_teach", action="store_true",
 parser.add_argument("--gan_d_steps", type=int, default=5,
                     help="Discriminator train steps, do gan_d_sample x gan_d_epochs samples one step.")
 parser.add_argument("--gan_d_sample", type=int, default=1000)
-parser.add_argument("--gan_d_epochs", type=int, default=3)
+parser.add_argument("--gan_d_epochs", type=int, default=6)
 parser.add_argument("--gan_d_batch_size", type=int, default=64)
 
-DIS_TRAIN_ARGS = "--gen_load_path checkpoints/3.8_3/gan_gen_bestbleu_0_19.520000.bin --dis_load_path dis_bestloss_3_0.350139.bin --do_dis_train --dis_fakegen_train_sample 500 --dis_fakegen_valid_sample 100 --fakegen_batch_size 64 --device_ids 2 --output_dir 3.18-1".split()
+DIS_TRAIN_ARGS = "--gen_load_path checkpoints/3.8_3/gan_gen_bestbleu_0_19.520000.bin --dis_load_path dis_bestloss_3_0.350139.bin --do_dis_train --dis_train_sample 500 --dis_valid_sample 100 --fakegen_batch_size 64 --device_ids 2 --output_dir 3.18-1".split()
 
-GAN_TRAIN_ARGS = "--gen_load_path checkpoints/3.8_3/gan_gen_bestbleu_0_19.520000.bin --dis_load_path checkpoints/3.8_3/gan_dis_bestbleu_0_19.520000.bin --do_gan_train --gan_teach --gan_train_epochs 10 --gan_batch_size 2 --gan_rollnum 20 --gan_g_step 100 --gan_d_sample 1000 --gan_d_step 10 --gan_d_epochs 10 --fakegen_batch_size 32 --gen_device_ids 3 --dis_device_ids 3 --output_dir 3.16-1".split()
+GAN_TRAIN_ARGS = "--gen_load_path checkpoints/3.8_3/gan_gen_bestbleu_0_19.520000.bin --dis_load_path checkpoints/3.8_3/gan_dis_bestbleu_0_19.520000.bin --do_gan_train --gan_teach --gan_train_epochs 10 --gan_batch_size 2 --gan_rollnum 20 --gan_g_step 100 --gan_d_sample 1000 --gan_d_step 10 --gan_d_epochs 10 --fakegen_batch_size 32 --device_ids 3 --output_dir current".split()
 
 args = parser.parse_args(DIS_TRAIN_ARGS if is_notebook() else sys.argv[1:])
 
@@ -175,14 +174,14 @@ else:
         args.gen_device_ids or args.device_ids)
     gen_device = gen_device_ids[0]
 
-    for device in args.gen_device_ids:
+    for device in gen_device_ids:
         occupy_mem(device)
 
     dis_device_ids = validate_device_ids(
         args.dis_device_ids or args.device_ids)
     dis_device = dis_device_ids[0]
 
-    for device in args.dis_device_ids:
+    for device in dis_device_ids:
         occupy_mem(device)
 
 
@@ -293,10 +292,12 @@ logging.info("bleu dataset: %d samples", len(bleu_dataset))
 def build_parallel(raw_model, args, load_path="", device=0, device_ids=[]):
     if load_path:
         logging.info(f"Load model from {load_path}")
-        raw_model.load_state_dict(
-            torch.load(load_path,
-                       map_location=torch.device(device))
-        )
+        weights = torch.load(load_path,
+                             map_location=torch.device(device))
+        if 'encoder.pooler.dense.weight' in weights:
+            del weights['encoder.pooler.dense.weight']
+            del weights['encoder.pooler.dense.bias']
+        raw_model.load_state_dict(weights)
 
     raw_model.to(device)
 

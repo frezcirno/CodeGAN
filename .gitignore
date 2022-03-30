@@ -41,3 +41,4 @@ tags
 *.npy
 *.log
 /old_checkpoints
+/runs
