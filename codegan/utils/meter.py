@@ -29,14 +29,30 @@ class FoldableMeter(Meter):
         return self.get()
 
 
-class MaxMeter(FoldableMeter):
+class HasBestMixin(object):
     def __init__(self):
-        super().__init__(max, 0)
+        self._is_best = False
+
+    def is_best(self):
+        return self._is_best
 
 
-class MinMeter(FoldableMeter):
+class MaxMeter(FoldableMeter, HasBestMixin):
+    def __init__(self):
+        super().__init__(max, -1e6)
+
+    def update(self, val):
+        self._is_best = val >= super().get()
+        return super().update(val)
+
+
+class MinMeter(FoldableMeter, HasBestMixin):
     def __init__(self):
         super().__init__(min, 1e6)
+
+    def update(self, val):
+        self._is_best = val <= super().get()
+        return super().update(val)
 
 
 class SumMeter(FoldableMeter):

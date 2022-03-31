@@ -34,11 +34,11 @@ resources/
 *.csv
 tags
 *.jsonl
-/current
-/checkpoints
-/ref
+/ckpts
 *.bin
 *.npy
 *.log
-/old_checkpoints
 /runs
+codegan/preprocess/cb_preprocess/dataset.zip
+codegan/preprocess/cb_preprocess/dataset/
+/cache

@@ -1,10 +1,11 @@
+import os
 from typing import List
 from torch import Tensor
 from transformers import RobertaTokenizer
 
 
-tokenizer = RobertaTokenizer.from_pretrained(
-    "tokenizer",
+tokenizer: RobertaTokenizer = RobertaTokenizer.from_pretrained(
+    os.path.dirname(__file__) + "/data",
     do_lower_case=True
 )
 
@@ -42,10 +43,15 @@ def id_to_text(pred_ids: List[int]):
     return text
 
 
-def tensor_to_text(pred_ids: Tensor):
+def tensor_to_text(pred_ids: Tensor) -> List[str]:
     pred_ids = list(pred_ids.cpu().numpy())
     return id_to_text(pred_ids)
 
 
-def tensors_to_text(pred_ids: Tensor):
+def tensors_to_text(pred_ids: Tensor) -> List[List[str]]:
     return [tensor_to_text(sample) for sample in pred_ids]
+
+
+if __name__ == '__main__':
+    tokens = tokenize("def tensors_to_text(pred_ids: Tensor): return [tensor_to_text(sample) for sample in pred_ids]")
+    print(tokens)

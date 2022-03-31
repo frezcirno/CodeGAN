@@ -16,11 +16,14 @@
 """PyTorch RoBERTa model. """
 
 import math
+from typing import Dict, List
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 import torch.nn.functional as F
+from transformers.utils import logging
+from transformers.configuration_utils import PretrainedConfig
 
 from transformers.modeling_utils import (
     PreTrainedModel,
@@ -28,7 +31,6 @@ from transformers.modeling_utils import (
     find_pruneable_heads_and_indices,
     prune_linear_layer,
 )
-from configuration_roberta import RobertaConfig
 
 '''
 RobertaConfig {
@@ -49,7 +51,6 @@ RobertaConfig {
   "model_type": "roberta",
   "num_attention_heads": 12,
   "num_hidden_layers": 12,
-  "output_past": true,
   "pad_token_id": 1,
 #   "position_embedding_type": "absolute",
   "transformers_version": "4.14.1",
@@ -59,8 +60,123 @@ RobertaConfig {
 }
 '''
 
+
+class RobertaConfig(PretrainedConfig):
+    r"""
+    This is the configuration class to store the configuration of a :class:`~transformers.RobertaModel` or a
+    :class:`~transformers.TFRobertaModel`. It is used to instantiate a RoBERTa model according to the specified
+    arguments, defining the model architecture.
+
+
+    Configuration objects inherit from :class:`~transformers.PretrainedConfig` and can be used to control the model
+    outputs. Read the documentation from :class:`~transformers.PretrainedConfig` for more information.
+
+    The :class:`~transformers.RobertaConfig` class directly inherits :class:`~transformers.BertConfig`. It reuses the
+    same defaults. Please check the parent class for more information.
+
+    Args:
+        vocab_size (:obj:`int`, `optional`, defaults to 30522):
+            Vocabulary size of the BERT model. Defines the number of different tokens that can be represented by the
+            :obj:`inputs_ids` passed when calling :class:`~transformers.BertModel` or
+            :class:`~transformers.TFBertModel`.
+        hidden_size (:obj:`int`, `optional`, defaults to 768):
+            Dimensionality of the encoder layers and the pooler layer.
+        num_hidden_layers (:obj:`int`, `optional`, defaults to 12):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (:obj:`int`, `optional`, defaults to 12):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        intermediate_size (:obj:`int`, `optional`, defaults to 3072):
+            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder.
+        hidden_act (:obj:`str` or :obj:`Callable`, `optional`, defaults to :obj:`"gelu"`):
+            The non-linear activation function (function or string) in the encoder and pooler. If string,
+            :obj:`"gelu"`, :obj:`"relu"`, :obj:`"silu"` and :obj:`"gelu_new"` are supported.
+        hidden_dropout_prob (:obj:`float`, `optional`, defaults to 0.1):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        attention_probs_dropout_prob (:obj:`float`, `optional`, defaults to 0.1):
+            The dropout ratio for the attention probabilities.
+        max_position_embeddings (:obj:`int`, `optional`, defaults to 512):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 512 or 1024 or 2048).
+        type_vocab_size (:obj:`int`, `optional`, defaults to 2):
+            The vocabulary size of the :obj:`token_type_ids` passed when calling :class:`~transformers.BertModel` or
+            :class:`~transformers.TFBertModel`.
+        initializer_range (:obj:`float`, `optional`, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        layer_norm_eps (:obj:`float`, `optional`, defaults to 1e-12):
+            The epsilon used by the layer normalization layers.
+        position_embedding_type (:obj:`str`, `optional`, defaults to :obj:`"absolute"`):
+            Type of position embedding. Choose one of :obj:`"absolute"`, :obj:`"relative_key"`,
+            :obj:`"relative_key_query"`. For positional embeddings use :obj:`"absolute"`. For more information on
+            :obj:`"relative_key"`, please refer to `Self-Attention with Relative Position Representations (Shaw et al.)
+            <https://arxiv.org/abs/1803.02155>`__. For more information on :obj:`"relative_key_query"`, please refer to
+            `Method 4` in `Improve Transformer Models with Better Relative Position Embeddings (Huang et al.)
+            <https://arxiv.org/abs/2009.13658>`__.
+        use_cache (:obj:`bool`, `optional`, defaults to :obj:`True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if ``config.is_decoder=True``.
+        classifier_dropout (:obj:`float`, `optional`):
+            The dropout ratio for the classification head.
+
+    Examples::
+
+        >>> from transformers import RobertaConfig, RobertaModel
+
+        >>> # Initializing a RoBERTa configuration
+        >>> configuration = RobertaConfig()
+
+        >>> # Initializing a model from the configuration
+        >>> model = RobertaModel(configuration)
+
+        >>> # Accessing the model configuration
+        >>> configuration = model.config
+    """
+    model_type = "roberta"
+
+    def __init__(
+        self,
+        vocab_size=50265,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=514,
+        type_vocab_size=1,
+        initializer_range=0.02,
+        layer_norm_eps=1e-05,
+        bos_token_id=0,
+        pad_token_id=1,
+        eos_token_id=2,
+        position_embedding_type="absolute",
+        classifier_dropout=None,
+        transformers_version="4.14.1",
+        **kwargs
+    ):
+        super().__init__(transformers_version=transformers_version, **kwargs)
+
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.hidden_act = hidden_act
+        self.intermediate_size = intermediate_size
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.max_position_embeddings = max_position_embeddings
+        self.type_vocab_size = type_vocab_size
+        self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.position_embedding_type = position_embedding_type
+        self.classifier_dropout = classifier_dropout
+        self.bos_token_id = bos_token_id
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id
+
+
 class RobertaEmbeddings(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: RobertaConfig):
         super().__init__()
         self.padding_idx = config.pad_token_id
 
@@ -129,11 +245,7 @@ class RobertaSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-    ):
+    def forward(self, hidden_states, attention_mask):
         mixed_query_layer = self.query(hidden_states)
 
         key_layer = self.transpose_for_scores(self.key(hidden_states))
@@ -292,74 +404,15 @@ class RobertaEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
-        self.gradient_checkpointing = False
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-    ):
-        for i, layer_module in enumerate(self.layer):
-            if self.gradient_checkpointing and self.training:
+    def forward(self, hidden_states, attention_mask):
+        for layer_module in self.layer:
+            hidden_states = layer_module(hidden_states, attention_mask)
 
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    layer_module,
-                    hidden_states,
-                    attention_mask,
-                )
-            else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    attention_mask,
-                )
-
-            hidden_states = layer_outputs
-
-        last_hidden_state = hidden_states
-        return last_hidden_state
+        return hidden_states
 
 
-class RobertaPreTrainedModel(PreTrainedModel):
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
-
-    config_class = RobertaConfig
-    base_model_prefix = "roberta"
-    supports_gradient_checkpointing = True
-
-    def _init_weights(self, module):
-        """Initialize the weights"""
-        if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, RobertaEncoder):
-            module.gradient_checkpointing = value
-
-    def update_keys_to_ignore(self, config, del_keys_to_ignore):
-        """Remove some keys from ignore list"""
-        if not config.tie_word_embeddings:
-            # must make a new list, or the class variable gets modified!
-            self._keys_to_ignore_on_save = [k for k in self._keys_to_ignore_on_save if k not in del_keys_to_ignore]
-            self._keys_to_ignore_on_load_missing = [
-                k for k in self._keys_to_ignore_on_load_missing if k not in del_keys_to_ignore
-            ]
-
-
-class RobertaModel(RobertaPreTrainedModel):
+class RobertaModel(PreTrainedModel):
     """
 
     The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
@@ -370,7 +423,8 @@ class RobertaModel(RobertaPreTrainedModel):
     .. _`Attention is all you need`: https://arxiv.org/abs/1706.03762
 
     """
-
+    config_class = RobertaConfig
+    base_model_prefix = "roberta"
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def __init__(self, config):
@@ -382,7 +436,6 @@ class RobertaModel(RobertaPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.init_weights()
-        self._backward_compatibility_gradient_checkpointing()
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -423,6 +476,59 @@ class RobertaModel(RobertaPreTrainedModel):
 
         return encoder_outputs
 
+    def init_weights(self):
+        """
+        If needed prunes and maybe initializes weights.
+        """
+        # Prune heads if needed
+        if self.config.pruned_heads:
+            self.prune_heads(self.config.pruned_heads)
+
+        # Initialize weights recursively to every submodule
+        self.apply(self._init_weights)
+
+    def prune_heads(self, heads_to_prune: Dict[int, List[int]]):
+        """
+        Prunes heads of the base model.
+
+        Arguments:
+            heads_to_prune (:obj:`Dict[int, List[int]]`):
+                Dictionary with keys being selected layer indices (:obj:`int`) and associated values being the list of
+                heads to prune in said layer (list of :obj:`int`). For instance {1: [0, 2], 2: [2, 3]} will prune heads
+                0 and 2 on layer 1 and heads 2 and 3 on layer 2.
+        """
+        # save new sets of pruned heads as union of previously stored pruned heads and newly pruned heads
+        for layer, heads in heads_to_prune.items():
+            union_heads = set(self.config.pruned_heads.get(layer, [])) | set(heads)
+            self.config.pruned_heads[layer] = list(union_heads)  # Unfortunately we have to store it as list for JSON
+
+        self._prune_heads(heads_to_prune)
+
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, nn.Linear):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def update_keys_to_ignore(self, config, del_keys_to_ignore):
+        """Remove some keys from ignore list"""
+        if not config.tie_word_embeddings:
+            # must make a new list, or the class variable gets modified!
+            self._keys_to_ignore_on_save = [k for k in self._keys_to_ignore_on_save if k not in del_keys_to_ignore]
+            self._keys_to_ignore_on_load_missing = [
+                k for k in self._keys_to_ignore_on_load_missing if k not in del_keys_to_ignore
+            ]
+
 
 def create_position_ids_from_input_ids(input_ids, padding_idx):
     """
@@ -438,3 +544,7 @@ def create_position_ids_from_input_ids(input_ids, padding_idx):
     mask = input_ids.ne(padding_idx).int()
     incremental_indices = torch.cumsum(mask, dim=1).type_as(mask) * mask
     return incremental_indices.long() + padding_idx
+
+
+if __name__ == '__main__':
+    model = RobertaModel()

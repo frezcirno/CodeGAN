@@ -2,6 +2,8 @@ import logging
 import os
 import torch
 
+logger = logging.getLogger(__name__)
+
 
 def check_mem(device: int):
     info = os.popen(
@@ -14,8 +16,7 @@ def __occupy_mem(device):
     x = torch.rand((256, 1024, int(total * 0.8 - used)), device=device)
     del x
     _, new_used = check_mem(device)
-    logging.info("Occupy GPU %d: (%d -> %d)/%d", device,
-                 used, new_used, total)
+    logger.info("Occupy GPU %d: (%d -> %d)/%d", device, used, new_used, total)
 
 
 occupied = []
