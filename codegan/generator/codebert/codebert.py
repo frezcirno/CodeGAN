@@ -98,19 +98,27 @@ class Generator(nn.Module):
         memory: Tensor,
         memory_key_padding_mask: Tensor
     ) -> Tensor:
+        """
+        Input:
+            target_ids: [batch_size x tgt_len]
+            context: [batch_size x src_max_len x hidden_size]
+            memory_key_padding_mask: same as source_mask
+        Output:
+            decode_output: [batch_size x tgt_len x hidden_size]
+        """
         # Embedding target
-        tgt = self.encoder.embeddings(target_ids)  # [batch_size x tgt_max_len x hidden_size]
-        tgt_mask = self.bias[: target_ids.shape[1], : target_ids.shape[1]]  # [tgt_max_len x tgt_max_len]
+        tgt = self.encoder.embeddings(target_ids)  # [batch_size x tgt_len x hidden_size]
+        tgt_mask = self.bias[: target_ids.shape[1], : target_ids.shape[1]]  # [tgt_len x tgt_len]
 
         # Decode
-        # [batch_size x tgt_max_len x hidden_size]
-        out = self.decoder(
+        # [batch_size x tgt_len x hidden_size]
+        decode_output = self.decoder(
             tgt=tgt,
+            tgt_mask=tgt_mask,  # [tgt_len x tgt_len]
             memory=memory,  # [batch_size x src_max_len x hidden_size]
-            tgt_mask=tgt_mask,  # [tgt_max_len x tgt_max_len]
             memory_key_padding_mask=memory_key_padding_mask,
         )
-        return out
+        return decode_output
 
     def decode(
         self,
@@ -137,7 +145,7 @@ class Generator(nn.Module):
     ) -> Tensor:
         """
         Input:
-            target_ids: [batch_size x tgt_max_len]
+            target_ids: [batch_size x tgt_len]
             context: [batch_size x src_max_len x hidden_size]
             memory_key_padding_mask: same as source_mask
         Output:
@@ -188,9 +196,9 @@ class Generator(nn.Module):
             source_mask: [batch_size x src_max_len]
                         values: [   1,    ...,    1,    n * 0]
             target_ids: [batch_size x tgt_max_len]
-                        values: [id(bos), ..., id(eos), n * id(pad)]
+                        values: [id(bos), ..., id(eos), m * id(pad)]
             target_mask: [batch_size x tgt_max_len]
-                        values: [   1,    ...,    1,    n * 0]
+                        values: [   1,    ...,    1,    m * 0]
 
         Outputs:
             loss: average of all loss
@@ -205,7 +213,7 @@ class Generator(nn.Module):
 
         # Truncate
         # [batch_size x (tgt_max_len-1) x vocab_size]
-        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_logits = lm_logits[:, :-1, :]
 
         # Eval bos_token is invalid
         # [(batch_size*(tgt_max_len-1)) ]
@@ -290,7 +298,7 @@ class Generator(nn.Module):
             preds.append(raw)
 
         # [batch_size x max_length] (value: id)
-        return torch.tensor(preds, dtype=torch.int64, device=device)
+        return torch.tensor(preds, dtype=torch.int64, device=device), None
 
     def predict(self, source_ids, source_mask):
         """
@@ -322,7 +330,8 @@ class Generator(nn.Module):
             # [batch_size x vocab_size] (value: probs)
             last_logits = self.decode_last(target_ids, memory, memory_key_padding_mask)
 
-            out: Tensor = self.lsm(last_logits)
+            # out: Tensor = self.lsm(last_logits)
+            out = last_logits
 
             pred = out.argmax(1)  # [batch_size ] (values: id)
             target_ids = torch.cat([target_ids, pred.unsqueeze(1)], 1)
@@ -353,20 +362,10 @@ class Generator(nn.Module):
 
         for _ in range(init_given_num, self.max_length):
             # [batch_size x i]
-            tgt = self.encoder.embeddings(target_ids)  # [batch_size x i x hidden_size]
-            tgt_mask = self.bias[: target_ids.shape[1], : target_ids.shape[1]]
-            out = self.decoder(
-                tgt,  # [batch_size x i x hidden_size]
-                context,  # [batch_size x src_max_len x hidden_size]
-                tgt_mask=tgt_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )  # [batch_size x i x hidden_size]
-            out = out[:, -1, :]
-            out = self.dense(out)
-            out = self.lm_head(out)
+            last_logit = self.decode_last(target_ids, context, memory_key_padding_mask)
             # [batch_size x vocab_size]
 
-            pred = torch.multinomial(out.softmax(1), 1)  # sampling one sample
+            pred = torch.multinomial(last_logit.softmax(1), 1)  # sampling one sample
             # [batch_size ]
 
             target_ids = torch.cat([target_ids, pred], 1)

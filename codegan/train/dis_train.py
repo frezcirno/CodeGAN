@@ -14,7 +14,7 @@ from codegan.train.gen_train import GenTrainer
 
 
 from .common import load_dataset
-from .utils import Trainer, add_general_arguments, build_parallel, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, validate_device_ids
+from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, validate_device_ids
 from ..utils import set_seed
 from ..utils.dist import is_distributed, local_rank, rank, world_size
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
@@ -29,7 +29,7 @@ class DisTrainer(Trainer):
     def __init__(self, args, run_dir, device, parallel=True):
         super().__init__(args, run_dir)
 
-        self.dis = Discriminator(
+        self.model = Discriminator(
             args.src_max_len,
             args.tgt_max_len,
             args.vocab_size,
@@ -37,13 +37,13 @@ class DisTrainer(Trainer):
         )
 
         if args.load_path:
-            self.dis = self.load_model(self.dis, args.load_path, device)
+            self.model = self.load_model(self.model, args.load_path, device)
 
         self.gen.to(device)
 
         if parallel:
-            self.dis = build_parallel(
-                self.dis,
+            self.model = self.build_parallel(
+                self.model,
                 find_unused_parameters=False,
                 load_path=args.load_path,
                 device=device
@@ -85,10 +85,10 @@ class DisTrainer(Trainer):
         return x.to(self.device)
 
     def dis_train(self):
-        self.dis.train()
+        self.model.train()
 
     def dis_eval(self):
-        self.dis.eval()
+        self.model.eval()
 
     def train_epoch(self, dataloader):
         self.dis_train()
@@ -99,7 +99,7 @@ class DisTrainer(Trainer):
                 target_ids = self.to_dis_device(batch[1])
                 labels = self.to_dis_device(batch[2])
 
-                prob = self.dis(source_ids, target_ids)
+                prob = self.model(source_ids, target_ids)
                 loss = F.binary_cross_entropy(prob, labels, reduction='sum')
                 # mean() to average on multi-gpu
                 if loss.size():
@@ -114,7 +114,7 @@ class DisTrainer(Trainer):
 
     def prepare_optimizer(self):
         self.opt = optim.Adam(
-            self.dis.parameters(),
+            self.model.parameters(),
             lr=self.learning_rate,
             eps=self.adam_epsilon
         )
@@ -160,14 +160,14 @@ class DisTrainer(Trainer):
 
     def eval_loss(self, dataset):
         self.dis_eval()
-        avg_loss = eval_dis_loss(self.dis, self.device, dataset,
+        avg_loss = eval_dis_loss(self.model, self.device, dataset,
                                  self.batch_size, self.num_workers)
         logger.info("+ BCEloss = %f", avg_loss)
         return avg_loss
 
     def eval_acc(self, dataset):
         self.dis_eval()
-        acc = eval_dis_acc(self.dis, self.device, dataset,
+        acc = eval_dis_acc(self.model, self.device, dataset,
                            self.batch_size, self.num_workers)
         logger.info("+ Accu = %f", acc)
         return acc
@@ -195,6 +195,7 @@ if __name__ == '__main__':
     GenTrainer.add_arguments(parser)
     parser.add_argument('--gen_load_path', type=str)
     parser.add_argument('--gen_batch_size', type=int, default=64)
+    parser.add_argument('--gen_beam_search', action='store_true')
     parser.add_argument('--gen_num_train_batchs', type=int, default=2000)
     parser.add_argument('--gen_num_valid_batchs', type=int, default=200)
     parser.add_argument('--gen_num_test_batchs', type=int, default=200)
@@ -223,14 +224,17 @@ if __name__ == '__main__':
     train_dataset = fakegen2(_gen.model, _device, train_dataset,
                              args.gen_num_train_batchs,
                              args.gen_batch_size,
+                             args.gen_beam_search,
                              args.num_workers)
     valid_dataset = fakegen2(_gen.model, _device, valid_dataset,
                              args.gen_num_valid_batchs,
                              args.gen_batch_size,
+                             args.gen_beam_search,
                              args.num_workers)
     test_dataset = fakegen2(_gen.model, _device, test_dataset,
                             args.gen_num_test_batchs,
                             args.gen_batch_size,
+                            args.gen_beam_search,
                             args.num_workers)
     _gen = None
 

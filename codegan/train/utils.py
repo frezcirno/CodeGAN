@@ -90,7 +90,8 @@ def save_model(model, path):
     torch.save(model_to_save.state_dict(), path)
 
 
-def make_gan_dataset(gen, device, dataloader, num_batchs=0) -> TensorDataset:
+def make_gan_dataset(gen, device, dataloader,
+                     num_batchs=0, beam_search=True) -> TensorDataset:
     all_source_ids = []
     all_target_ids = []
     batch_size_sum = 0
@@ -107,8 +108,14 @@ def make_gan_dataset(gen, device, dataloader, num_batchs=0) -> TensorDataset:
             all_source_ids.append(source_ids)
             all_target_ids.append(target_ids)
 
-            g_target_ids = gen(source_ids.to(device), source_mask.to(device), beam_search=True).to('cpu')
-            all_target_ids.append(g_target_ids)
+            g_target_ids, _ = gen(source_ids.to(device),
+                                  source_mask.to(device),
+                                  beam_search=beam_search)
+            all_target_ids.append(g_target_ids.to('cpu'))
+
+            print(tokenize.tensor_to_text(source_ids[0]))
+            print(tokenize.tensor_to_text(target_ids[0]))
+            print(tokenize.tensors_to_text(g_target_ids))
 
             batch_size_sum += batch_size
 
@@ -125,7 +132,8 @@ def make_gan_dataset(gen, device, dataloader, num_batchs=0) -> TensorDataset:
     return TensorDataset(all_source_ids, all_target_ids, all_labels)
 
 
-def fakegen2(gen, device, dataset: TensorDataset, num_batchs, batch_size, num_workers=4) -> TensorDataset:
+def fakegen2(gen, device, dataset: TensorDataset,
+             num_batchs, batch_size, beam_search=False, num_workers=4) -> TensorDataset:
     # if is_distributed():
     #     sampler = DistributedSampler(dataset)
     # else:
@@ -140,7 +148,7 @@ def fakegen2(gen, device, dataset: TensorDataset, num_batchs, batch_size, num_wo
         sampler=sampler,
     )
 
-    return make_gan_dataset(gen, device, dataloader, num_batchs=num_batchs)
+    return make_gan_dataset(gen, device, dataloader, num_batchs=num_batchs, beam_search=beam_search)
 
 
 def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
@@ -264,8 +272,8 @@ def eval_gen_bleu(
             source_mask = batch[1]
             target_ids = batch[2]
             with torch.no_grad():
-                preds = gen(source_ids.to(device),
-                            source_mask.to(device), beam_search=True)
+                preds, _ = gen(source_ids.to(device),
+                               source_mask.to(device), beam_search=True)
                 predicts.extend(tensors_to_text(preds))
                 golds.extend(tensors_to_text(target_ids))
 
@@ -389,28 +397,6 @@ def add_general_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--occupy", action="store_true")
 
 
-def build_parallel(
-    raw_model,
-    find_unused_parameters,
-    device=0,
-    dp_device_ids=[]
-):
-    if is_distributed():
-        logger.info("Using DistributedDataParallel")
-        model = DDP(raw_model,
-                    device_ids=[device],
-                    find_unused_parameters=find_unused_parameters,
-                    broadcast_buffers=False)
-    elif len(dp_device_ids) > 1:
-        logger.info("Using DataParallel")
-        model = DP(raw_model, dp_device_ids)
-        model.device = device
-    else:
-        model = raw_model
-
-    return model
-
-
 class Trainer(object):
     def __init__(self, args, run_dir):
         self.do_train = args.do_train
@@ -430,11 +416,38 @@ class Trainer(object):
         self.run_path = run_dir
         self.paths = {}
 
+    @classmethod
+    def build_parallel(
+        cls,
+        model,
+        find_unused_parameters,
+        device=0,
+        dp_device_ids=[]
+    ):
+        if is_distributed():
+            logger.info("Using DistributedDataParallel")
+            model = DDP(model,
+                        device_ids=[device],
+                        find_unused_parameters=find_unused_parameters,
+                        broadcast_buffers=False)
+        elif len(dp_device_ids) > 1:
+            logger.info("Using DataParallel")
+            model = DP(model, dp_device_ids)
+            model.device = device
+
+        return model
+
     def run(self, *datasets):
         if self.do_train:
             self.train(*datasets)
         if self.do_eval:
             self.eval(*datasets)
+
+    def train(self, *datasets):
+        logger.error("No train operation!")
+
+    def eval(self, *datasets):
+        logger.error("No eval operation!")
 
     def register_path(self, key, path):
         if key in self.paths:
@@ -458,6 +471,17 @@ class Trainer(object):
         parser.add_argument("--adam_epsilon", type=float, default=1e-8)
         parser.add_argument("--weight_decay", type=float, default=0.0)
         parser.add_argument("--load_path", help="The path to the generator model")
+
+    @classmethod
+    def load_model(cls, model, load_path, map_location):
+        logger.info(f"Load model from {load_path}")
+        weights = torch.load(load_path,
+                             map_location=torch.device(map_location))
+        if 'encoder.pooler.dense.weight' in weights:
+            del weights['encoder.pooler.dense.weight']
+            del weights['encoder.pooler.dense.bias']
+        model.load_state_dict(weights)
+        return model
 
 
 def init_run_dir(bookmark: Optional[str] = None) -> str:

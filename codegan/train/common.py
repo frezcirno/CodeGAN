@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
-from .utils import Trainer, add_general_arguments, build_parallel, eval_gen_bleu, eval_gen_loss, is_notebook, save_model, to_features, pad_features
+from .utils import Trainer, add_general_arguments, eval_gen_bleu, eval_gen_loss, is_notebook, save_model, to_features, pad_features
 from ..utils.cache import cache_result
 
 
