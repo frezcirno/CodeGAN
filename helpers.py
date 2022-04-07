@@ -37,9 +37,9 @@ from tokenizer import str_to_ids, tensors_to_text
 
 def to_features(df):
     def make_features(s):
-        code_tokens, code_ids = str_to_ids(s.recode)
+        code_tokens, code_ids = str_to_ids(s.code)
 
-        doc_tokens, doc_ids = str_to_ids(s.redocstring)
+        doc_tokens, doc_ids = str_to_ids(s.docstring)
 
         return {
             "code_tokens": code_tokens,

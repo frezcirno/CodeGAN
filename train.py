@@ -353,7 +353,7 @@ if args.do_dis_train or args.do_dis_eval or args.do_gan_train:
 
 # %%
 if args.do_gen_train or args.do_gen_eval:
-    gen_train = GenTrainer(args, _gen, gen, jd_bleu.index, jd_bleu.redocstring)
+    gen_train = GenTrainer(args, _gen, gen, jd_bleu.index, jd_bleu.docstring)
 
     if args.do_gen_train:
         gen_train.train(train_dataset, valid_dataset, bleu_dataset)
@@ -372,7 +372,7 @@ if args.do_dis_train or args.do_dis_eval:
 # %%
 if args.do_gan_train or args.do_gan_eval:
     gan_train = GanTrainer(args, _gen, gen, _dis,
-                           dis, jd_bleu.index, jd_bleu.redocstring)
+                           dis, jd_bleu.index, jd_bleu.docstring)
     if args.do_gan_train:
         gan_train.train(train_dataset, valid_dataset, bleu_dataset)
     else:
