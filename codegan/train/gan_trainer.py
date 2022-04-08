@@ -8,12 +8,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
-from .utils import eval_gen_bleu
+from .utils import Trainer, eval_gen_bleu
 
 from ..bleu import bleu
 from ..tokenize import tensors_to_text
 from ..utils.dist import is_distributed
-from ..utils.meter import axMeter, BatchAvgMeter, MinMeter
+from ..utils.meter import MaxMeter, axMeter, BatchAvgMeter, MinMeter
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class Rollout:
         return rewards.to(pre_target_mask.device)
 
 
-class GanTrainer():
+class GanTrainer(Trainer):
     def __init__(self, args, _gen, gen, _dis, dis):
         self.args = args
         self._gen = _gen
@@ -221,7 +221,7 @@ class GanTrainer():
         source_mask = self.to_gen_device(batch[1])
 
         """672 MiB"""
-        context, memory_key_padding_mask = self._gen.get_context(source_ids, source_mask)
+        context, memory_key_padding_mask = self._gen.encode(source_ids, source_mask)
         # [batch_size x source_length x args.hidden_size]
 
         pre_target_ids, pre_target_mask = self.gen(context, memory_key_padding_mask)

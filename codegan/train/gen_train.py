@@ -1,6 +1,7 @@
 import logging
 import argparse
 from pathlib import Path
+from collections import OrderedDict
 import os
 import sys
 from typing import Literal
@@ -56,11 +57,15 @@ class GenTrainer(Trainer):
     @classmethod
     def load_model(cls, raw_model, load_path, map_location):
         logger.info(f"Load model from {load_path}")
-        weights = torch.load(load_path,
-                             map_location=torch.device(map_location))
+        weights: OrderedDict = torch.load(load_path,
+                                          map_location=torch.device(map_location))
         if 'encoder.pooler.dense.weight' in weights:
             del weights['encoder.pooler.dense.weight']
             del weights['encoder.pooler.dense.bias']
+        for key in list(weights.keys()):
+            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
+                new_key = f'decoder.{key}'
+                weights[new_key] = weights.pop(key)
         raw_model.load_state_dict(weights)
         return raw_model
 

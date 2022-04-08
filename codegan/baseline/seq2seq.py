@@ -76,7 +76,6 @@ class Encoder(nn.Module):
         # initial decoder hidden is final hidden state of the forwards and backwards
         # encoder RNNs fed through a linear layer
         # s = [batch_size, dec_hid_dim]
-        assert(hidden.size(0) == 2)
         hidden = torch.tanh(self.fc(torch.cat((hidden[0, :, :], hidden[1, :, :]), dim=1)))
 
         return enc_output, hidden
@@ -144,9 +143,10 @@ class Decoder(nn.Module):
         if self.with_attention:
             # Add attention
             attn = self.attention(hidden, enc_output).unsqueeze(1)  # [batch_size, 1, src_len]
+            # [1, src_len] @ [src_len, enc_hid_dim * 2] -> [1, enc_hid_dim * 2]
             enc_output = torch.bmm(attn, enc_output.transpose(0, 1)).transpose(0, 1)  # [1, batch_size, enc_hid_dim * 2]
         else:
-            enc_output = enc_output[-1]
+            enc_output = enc_output[-1:]
 
         # [1, batch_size, (enc_hid_dim * 2) + embed_size]
         rnn_input = torch.cat([tgt_embed, enc_output], dim=2)

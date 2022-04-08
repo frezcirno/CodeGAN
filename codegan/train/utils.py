@@ -115,7 +115,7 @@ def make_gan_dataset(gen, device, dataloader,
 
             print(tokenize.tensor_to_text(source_ids[0]))
             print(tokenize.tensor_to_text(target_ids[0]))
-            print(tokenize.tensors_to_text(g_target_ids))
+            print(tokenize.tensor_to_text(g_target_ids[0]))
 
             batch_size_sum += batch_size
 

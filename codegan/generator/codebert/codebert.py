@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,8 +72,6 @@ class Generator(nn.Module):
         self.dense = nn.Linear(hidden_size, hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self._tie_or_clone_weights(self.lm_head, self.encoder.get_input_embeddings())
-
-        self.lsm = nn.LogSoftmax(dim=-1)
 
     def _tie_or_clone_weights(self, output_embeddings, input_embeddings):
         """Tie or clone module weights depending of whether we are using TorchScript or not"""
@@ -208,8 +206,8 @@ class Generator(nn.Module):
 
         # [batch_size x src_max_len x args.hidden_size]
         memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
-
         lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)
+        lm_logits = F.softmax(lm_logits, dim=1)
 
         # Truncate
         # [batch_size x (tgt_max_len-1) x vocab_size]
@@ -264,12 +262,10 @@ class Generator(nn.Module):
             for _ in range(self.max_length):
                 if beam.done():
                     break
-                lm_logits = self.decode_last(btarget_ids, ctx, memory_key_padding_mask)  # [beam_size x hidden_size]
+                lm_logits = self.decode_last(btarget_ids, ctx, memory_key_padding_mask)
+                lm_logits = F.log_softmax(lm_logits, dim=1)  # [beam_size x vocab_size] (value: probs)
 
-                # [beam_size x vocab_size] (value: probs)
-                out = self.lsm(lm_logits).data
-
-                beam.advance(out)
+                beam.advance(lm_logits.data)
 
                 # generate a word
                 # copy_() - similar to assign
@@ -277,9 +273,7 @@ class Generator(nn.Module):
                     # index_select() - choose row(0) by indexes
                     btarget_ids.data.index_select(0, beam.getCurrentOrigin())
                 )
-                btarget_ids = torch.cat(
-                    (btarget_ids, beam.getCurrentState(source_ids.device)), -1
-                )
+                btarget_ids = torch.cat([btarget_ids, beam.getCurrentState(source_ids.device)], 1)
                 # [beam_size x i]
 
             # [beam_size x [n]] (values: token_id)
@@ -330,7 +324,7 @@ class Generator(nn.Module):
             # [batch_size x vocab_size] (value: probs)
             last_logits = self.decode_last(target_ids, memory, memory_key_padding_mask)
 
-            # out: Tensor = self.lsm(last_logits)
+            # out = F.log_softmax(last_logits, dim=1)
             out = last_logits
 
             pred = out.argmax(1)  # [batch_size ] (values: id)
@@ -363,9 +357,9 @@ class Generator(nn.Module):
         for _ in range(init_given_num, self.max_length):
             # [batch_size x i]
             last_logit = self.decode_last(target_ids, context, memory_key_padding_mask)
+            last_logit = F.softmax(last_logit, dim=1)
             # [batch_size x vocab_size]
-
-            pred = torch.multinomial(last_logit.softmax(1), 1)  # sampling one sample
+            pred = torch.multinomial(last_logit, 1)  # sampling one sample
             # [batch_size ]
 
             target_ids = torch.cat([target_ids, pred], 1)
@@ -385,6 +379,7 @@ class Generator(nn.Module):
             loss: (sum of a batch)
         """
         lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)  # [batch_size x tgt_max_len x vocab_size]
+        lm_logits = F.log_softmax(lm_logits)
         shift_logits = lm_logits[:, :-1, :]
         # [batch_size x tgt_max_len-1 x vocab_size]
 
@@ -409,93 +404,92 @@ class Generator(nn.Module):
 
 
 class Beam(object):
-    def __init__(self, size, device):
-        self.size = size
-        # The score for each translation on the beam.
-        self.scores = torch.zeros(size, dtype=torch.float, device=device)
+    def __init__(self, beam_size, device):
+        self.beam_size = beam_size
         # The backpointers at each time-step.
         self.prevKs = []
-        # The outputs at each time-step.
-        self.nextYs = [torch.zeros(size, dtype=torch.long, device=device)]
+        # The score for each translation on the beam.
+        self.scores: Tensor
+        # The outputs at each time-step. [1, beam_size]
+        self.nextYs = [torch.zeros(beam_size, dtype=torch.long, device=device)]
         self.nextYs[0][0] = tokenize.bos_token_id
         # Has EOS topped the beam yet.
         self.eosTop = False
-        # Time and k pair for finished.
-        self.finished = []
+        # Time and k pair for finished. List[Tuple[]]
+        self.finished: List[Tuple[Tensor, int, int]] = []
 
     def getCurrentState(self, device):
         """
         Get the outputs for the current timestep.
         Return: [beam_size x 1]
         """
-        return self.nextYs[-1].clone().detach().view(-1, 1).to(device)
+        return self.nextYs[-1].unsqueeze(1).to(device)
 
-    def getCurrentOrigin(self):
+    def getCurrentOrigin(self) -> Tensor:
         "Get the backpointers for the current timestep."
         return self.prevKs[-1]
 
-    def advance(self, wordLk):
+    def advance(self, lsm_logits: Tensor):
         """
-        Given prob over words for every last beam `wordLk` and attention
-        `attnOut`: Compute and update the beam search.
+        Given prob over words for every last beam `wordLk`
 
         Parameters:
 
-        * `wordLk`- probs of advancing from the last step [beam_size x vocab_size]
-        * `attnOut`- attention at the last step
-
-        Returns: True if beam search is complete.
+        * `lsm_logits`- probs of advancing from the last step [beam_size x vocab_size]
         """
-        numWords = wordLk.size(1)
+        vocab_size = lsm_logits.size(1)
 
         # Sum the previous scores.
-        if len(self.prevKs) > 0:
-            beamLk = wordLk + self.scores.unsqueeze(1).expand_as(wordLk)
+        if self.prevKs:
+            beamLk = lsm_logits + self.scores.unsqueeze(1).expand_as(lsm_logits)  # [beam_size, vocab_size]
 
             # Don't let EOS have children.
-            for i in range(self.nextYs[-1].size(0)):
-                if self.nextYs[-1][i] == tokenize.eos_token_id:
+            nextY = self.nextYs[-1]
+            for i in range(nextY.size(0)):
+                if nextY[i] == tokenize.eos_token_id:
                     beamLk[i] = -1e20
         else:
-            beamLk = wordLk[0]
-        flatBeamLk = beamLk.view(-1)
-        bestScores, bestScoresId = flatBeamLk.topk(self.size, 0, True, True)
+            beamLk = lsm_logits[0]  # [vocab_size]
 
+        flatBeamLk = beamLk.view(-1)  # [n * vocab_size]
+        bestScores, bestScoresId = flatBeamLk.topk(self.beam_size, 0)
         self.scores = bestScores
 
         # bestScoresId is flattened beam x word array, so calculate which
         # word and beam each score came from
-        prevK = torch.div(bestScoresId, numWords, rounding_mode="trunc")
+        prevK = bestScoresId.div(vocab_size, rounding_mode="trunc")
+        nextY = bestScoresId - prevK * vocab_size
         self.prevKs.append(prevK)
-        self.nextYs.append((bestScoresId - prevK * numWords))
+        self.nextYs.append(nextY)
 
-        for i in range(self.nextYs[-1].size(0)):
-            if self.nextYs[-1][i] == tokenize.eos_token_id:
-                s = self.scores[i]
-                self.finished.append((s, len(self.nextYs) - 1, i))
+        for i in range(nextY.size(0)):
+            if nextY[i] == tokenize.eos_token_id:
+                self.finished.append((self.scores[i], len(self.nextYs) - 1, i))
 
         # End condition is when top-of-beam is EOS and no global score.
-        if self.nextYs[-1][0] == tokenize.eos_token_id:
+        if nextY[0] == tokenize.eos_token_id:
             self.eosTop = True
 
     def done(self):
-        return self.eosTop and len(self.finished) >= self.size
+        return self.eosTop and len(self.finished) >= self.beam_size
 
-    def getFinal(self):
-        if len(self.finished) == 0:
+    def getFinal(self) -> List[Tuple[Tensor, int, int]]:
+        if not self.finished:
             self.finished.append((self.scores[0], len(self.nextYs) - 1, 0))
-        self.finished.sort(key=lambda a: -a[0])
-        if len(self.finished) != self.size:
-            unfinished = []
-            for i in range(self.nextYs[-1].size(0)):
-                if self.nextYs[-1][i] != tokenize.eos_token_id:
-                    s = self.scores[i]
-                    unfinished.append((s, len(self.nextYs) - 1, i))
-            unfinished.sort(key=lambda a: -a[0])
-            self.finished += unfinished[: self.size - len(self.finished)]
-        return self.finished[: self.size]
+        else:
+            self.finished.sort(key=lambda a: -a[0])
 
-    def getHyp(self, beam_res):
+        if len(self.finished) < self.beam_size:
+            nextY = self.nextYs[-1]
+            unfinished = [(self.scores[i], len(self.nextYs) - 1, i)
+                          for i in range(nextY.size(0))
+                          if nextY[i] != tokenize.eos_token_id]
+            unfinished.sort(key=lambda a: -a[0])
+            self.finished += unfinished[: self.beam_size - len(self.finished)]
+
+        return self.finished[: self.beam_size]
+
+    def getHyp(self, beam_res: List[Tuple[Tensor, int, int]]):
         """
         Walk back to construct the full hypothesis.
         """
@@ -509,12 +503,12 @@ class Beam(object):
         return hyps
 
     def buildTargetTokens(self, preds):
-        sentence = []
-        for pred in preds:
+        def f(pred):
             tokens = []
             for tok in pred:
                 if tok == tokenize.eos_token_id:
                     break
                 tokens.append(tok)
-            sentence.append(tokens)
-        return sentence
+            return tokens
+
+        return map(f, preds)

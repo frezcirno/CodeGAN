@@ -3,11 +3,10 @@ from os.path import join as path_join
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from transformers import RobertaTokenizer
 
-
-from helpers import cache_call
 
 # %%
 data_dir = "data_objs"
@@ -28,9 +27,9 @@ def str_to_ids(tkzr, inp):
 
 
 def make_features(s, tkzr):
-    code_tokens, code_ids = str_to_ids(tkzr, s.recode)
+    code_tokens, code_ids = str_to_ids(tkzr, s.code)
 
-    doc_tokens, doc_ids = str_to_ids(tkzr, s.redocstring)
+    doc_tokens, doc_ids = str_to_ids(tkzr, s.docstring)
 
     return {
         "code_tokens": code_tokens,
