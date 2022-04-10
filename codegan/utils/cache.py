@@ -1,11 +1,12 @@
-from functools import lru_cache
 import logging
 import os
+from typing import Literal
 import torch
 import numpy as np
 import pandas as pd
 import _pickle as cPickle
 from pandas.io.parquet import to_parquet
+from .dist import is_master
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def remember_result(func):
     return new_func
 
 
-def cache_result(path: str, format="parquet"):
+def cache_result(path: str, format: Literal['parquet|numpy|torch|pickle'] = "parquet"):
     def pickle_dump(obj, path):
         with open(path, "wb") as f:
             cPickle.dump(obj, f)
@@ -71,7 +72,8 @@ def cache_result(path: str, format="parquet"):
     postfix, saver, loader = FORMAT[format]
 
     path = str(path)
-    path += postfix
+    if not path.endswith(postfix):
+        path += postfix
 
     def decorate(func):
         def new_func(*args, **kwargs):
@@ -79,6 +81,8 @@ def cache_result(path: str, format="parquet"):
                 logger.info(f"load data from cache {path}")
                 return loader(path)
             res = func(*args, **kwargs)
+            if not is_master():
+                return res
             try:
                 if os.path.dirname(path):
                     os.makedirs(os.path.dirname(path), exist_ok=True)

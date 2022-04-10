@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 import random
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import List, Literal, Optional, OrderedDict, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.utils.data import TensorDataset, ConcatDataset, RandomSampler
 from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.data import (
     DataLoader,
@@ -23,7 +24,6 @@ from torch.utils.data import (
     SequentialSampler,
 )
 from torch.utils.data.distributed import DistributedSampler
-
 from codegan.utils.memory import occupy_mem
 # from torch.utils.tensorboard import SummaryWriter
 from .. import bleu, tokenize
@@ -94,6 +94,7 @@ def make_gan_dataset(gen, device, dataloader,
                      num_batchs=0, beam_search=True) -> TensorDataset:
     all_source_ids = []
     all_target_ids = []
+    all_g_target_ids = []
     batch_size_sum = 0
     batch_count = 0
 
@@ -111,11 +112,7 @@ def make_gan_dataset(gen, device, dataloader,
             g_target_ids, _ = gen(source_ids.to(device),
                                   source_mask.to(device),
                                   beam_search=beam_search)
-            all_target_ids.append(g_target_ids.to('cpu'))
-
-            print(tokenize.tensor_to_text(source_ids[0]))
-            print(tokenize.tensor_to_text(target_ids[0]))
-            print(tokenize.tensor_to_text(g_target_ids[0]))
+            all_g_target_ids.append(g_target_ids.to('cpu'))
 
             batch_size_sum += batch_size
 
@@ -125,20 +122,29 @@ def make_gan_dataset(gen, device, dataloader,
                     break
 
     all_source_ids = torch.cat(all_source_ids + all_source_ids)
-    all_target_ids = torch.cat(all_target_ids)
+    all_target_ids = torch.cat(all_target_ids + all_g_target_ids)
     all_labels = torch.cat([torch.ones(batch_size_sum, dtype=torch.float),
                             torch.zeros(batch_size_sum, dtype=torch.float)])
 
     return TensorDataset(all_source_ids, all_target_ids, all_labels)
 
 
-def fakegen2(gen, device, dataset: TensorDataset,
-             num_batchs, batch_size, beam_search=False, num_workers=4) -> TensorDataset:
-    # if is_distributed():
-    #     sampler = DistributedSampler(dataset)
-    # else:
-    #     sampler = SequentialSampler(dataset)
-    sampler = SequentialSampler(dataset)
+def fakegen2(
+    gen, device, dataset: TensorDataset,
+    num_batchs, batch_size,
+    beam_search=False, num_workers=4
+) -> TensorDataset:
+    """Generator mixed samples for discriminator training.
+
+    If it's distributed training, every process will generate a unique portion of `dataset`.
+
+    Outputs:
+        dataset: [source_ids, target_ids, labels]
+    """
+    if is_distributed():
+        sampler = DistributedSampler(dataset, drop_last=True)
+    else:
+        sampler = SequentialSampler(dataset)
 
     dataloader = DataLoader(
         dataset,
@@ -148,7 +154,14 @@ def fakegen2(gen, device, dataset: TensorDataset,
         sampler=sampler,
     )
 
-    return make_gan_dataset(gen, device, dataloader, num_batchs=num_batchs, beam_search=beam_search)
+    dataset = make_gan_dataset(gen, device, dataloader, num_batchs=num_batchs, beam_search=beam_search)
+    if is_distributed():
+        datasets = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(datasets, dataset)
+        tensors = [dataset.tensors for dataset in datasets]
+        return TensorDataset(*[torch.cat(ts) for ts in zip(*tensors)])
+    else:
+        return dataset
 
 
 def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
@@ -226,7 +239,7 @@ def fakegen(args, dataset, num_samples, _gen, train=True):
         if is_distributed():
             indices = torch.randperm(len(dataset))[:num_samples]
             subset = Subset(dataset, indices)
-            sampler = DistributedSampler(subset, shuffle=True)
+            sampler = DistributedSampler(subset, shuffle=True, drop_last=True)
         else:
             indices = torch.randperm(len(dataset))[:num_samples]
             sampler = SubsetRandomSampler(indices)
@@ -323,10 +336,13 @@ def eval_gen_loss(
     return loss
 
 
-def eval_dis_loss(dis, device: int,
-                  dataset: TensorDataset,
-                  batch_size: int,
-                  num_workers: int = 4) -> float:
+def eval_dis_loss(
+    dis: nn.Module,
+    device: int,
+    dataset: TensorDataset,
+    batch_size: int,
+    num_workers: int = 4,
+) -> float:
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -354,11 +370,17 @@ def eval_dis_loss(dis, device: int,
     return avg_loss
 
 
-def eval_dis_acc(args, dis, device: int, dataset: TensorDataset) -> float:
+def eval_dis_acc(
+    dis: nn.Module,
+    device: int,
+    dataset: TensorDataset,
+    batch_size: int,
+    num_workers: int = 4,
+) -> float:
     dataloader = DataLoader(
         dataset,
-        batch_size=args.dis_batch_size,
-        num_workers=args.num_workers,
+        batch_size=batch_size,
+        num_workers=num_workers,
         pin_memory=True,
     )
     acc_meter = BatchAvgMeter()
@@ -382,7 +404,8 @@ def eval_dis_acc(args, dis, device: int, dataset: TensorDataset) -> float:
 def validate_device_ids(device_ids: List[int]) -> List[int]:
     ngpu = torch.cuda.device_count()
 
-    return [dev_id for dev_id in device_ids if dev_id < ngpu] or [0]
+    return [dev_id for dev_id in device_ids if dev_id < ngpu] \
+        or (list(range(world_size())) if is_distributed() else [0])
 
 
 def add_general_arguments(parser: argparse.ArgumentParser):
@@ -473,15 +496,19 @@ class Trainer(object):
         parser.add_argument("--load_path", help="The path to the generator model")
 
     @classmethod
-    def load_model(cls, model, load_path, map_location):
+    def load_model(cls, raw_model, load_path, map_location):
         logger.info(f"Load model from {load_path}")
-        weights = torch.load(load_path,
-                             map_location=torch.device(map_location))
+        weights: OrderedDict = torch.load(load_path,
+                                          map_location=torch.device(map_location))
         if 'encoder.pooler.dense.weight' in weights:
             del weights['encoder.pooler.dense.weight']
             del weights['encoder.pooler.dense.bias']
-        model.load_state_dict(weights)
-        return model
+        for key in list(weights.keys()):
+            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
+                new_key = f'decoder.{key}'
+                weights[new_key] = weights.pop(key)
+        raw_model.load_state_dict(weights)
+        return raw_model
 
 
 def init_run_dir(bookmark: Optional[str] = None) -> str:

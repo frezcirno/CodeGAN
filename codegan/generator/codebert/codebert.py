@@ -163,16 +163,15 @@ class Generator(nn.Module):
         target_ids=None,
         target_mask=None,
         rewards=None,
-        rollout=False,
         init_given_num=None,
         beam_search=False,
     ):
         """
         has target_mask -> get_loss
-        rollout=True -> rollout_predict
+        init_given_num -> rollout_predict
         else -> greedy_predict
         """
-        if rollout:
+        if init_given_num is not None:
             return self.rollout_predict(source_ids, source_mask, target_ids, init_given_num)
 
         if rewards is not None:
@@ -336,7 +335,8 @@ class Generator(nn.Module):
         return mask_target(target_ids)
 
     def rollout_predict(
-        self, context, memory_key_padding_mask, init_target_ids, init_given_num
+        self,
+        source_ids, source_mask, init_target_ids, init_given_num
     ):
         """
         Predict like self.predict(), but
@@ -352,6 +352,8 @@ class Generator(nn.Module):
             target_ids: [batch_size x max_length]
             target_mask: [batch_size x max_length]
         """
+        context, memory_key_padding_mask = self.encode(source_ids, source_mask)
+
         target_ids = init_target_ids[:, :init_given_num]
 
         for _ in range(init_given_num, self.max_length):
@@ -511,4 +513,4 @@ class Beam(object):
                 tokens.append(tok)
             return tokens
 
-        return map(f, preds)
+        return [f(pred) for pred in preds]

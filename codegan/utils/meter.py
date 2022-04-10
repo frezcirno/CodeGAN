@@ -77,3 +77,8 @@ class BatchAvgMeter(Meter):
         self.values.append(val)
         self.weights.append(weight)
         return self.get()
+
+
+class Meaner():
+    def update(self, val, weight):
+        return val / weight

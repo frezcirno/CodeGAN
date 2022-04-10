@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class GenTrainer(Trainer):
-    def __init__(self, args, run_dir, device, parallel=True):
+    def __init__(self, args, run_dir, load_path, device, parallel=True):
         super().__init__(args, run_dir)
 
         self.args = args
@@ -39,8 +39,8 @@ class GenTrainer(Trainer):
             args.tgt_max_len,
         )
 
-        if args.load_path:
-            self.model = self.load_model(self.model, args.load_path, device)
+        if load_path:
+            self.model = self.load_model(self.model, load_path, device)
 
         self.model.to(device)
 
@@ -53,21 +53,6 @@ class GenTrainer(Trainer):
 
         self.best_loss = MinMeter()
         self.best_bleu = MaxMeter()
-
-    @classmethod
-    def load_model(cls, raw_model, load_path, map_location):
-        logger.info(f"Load model from {load_path}")
-        weights: OrderedDict = torch.load(load_path,
-                                          map_location=torch.device(map_location))
-        if 'encoder.pooler.dense.weight' in weights:
-            del weights['encoder.pooler.dense.weight']
-            del weights['encoder.pooler.dense.bias']
-        for key in list(weights.keys()):
-            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
-                new_key = f'decoder.{key}'
-                weights[new_key] = weights.pop(key)
-        raw_model.load_state_dict(weights)
-        return raw_model
 
     def to_model_device(self, x):
         return x.to(self.device)
@@ -157,7 +142,7 @@ class GenTrainer(Trainer):
         self.prepare_scheduler(train_dataset)
 
         if is_distributed():
-            sampler = DistributedSampler(train_dataset, shuffle=True)
+            sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
         else:
             sampler = RandomSampler(train_dataset)
 
@@ -266,5 +251,5 @@ if __name__ == '__main__':
     logger.info("valid dataset: %d samples", len(valid_dataset))
     logger.info("test dataset: %d samples", len(test_dataset))
 
-    trainer = GenTrainer(args, run_dir, _device)
+    trainer = GenTrainer(args, run_dir, args.load_path, _device)
     trainer.run(train_dataset, valid_dataset, test_dataset)

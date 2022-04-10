@@ -101,7 +101,7 @@ class SeqAttnTrainer(Trainer):
         self.prepare_optimizer()
 
         if is_distributed():
-            sampler = DistributedSampler(train_dataset, shuffle=True)
+            sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
         else:
             sampler = RandomSampler(train_dataset)
 

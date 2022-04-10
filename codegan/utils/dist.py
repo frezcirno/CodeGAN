@@ -1,6 +1,5 @@
-
-
 import os
+import torch.distributed as dist
 
 
 def env_get(key: str) -> str:
