@@ -1,0 +1,11 @@
+langdetect
+matplotlib
+pandas
+pytorch-lightning
+tensorboard
+torch
+torchaudio
+torchtext
+torchvision
+transformers
+pyarrow

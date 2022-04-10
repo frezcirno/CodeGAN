@@ -21,7 +21,7 @@ from ..utils import set_seed
 from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
 from ..utils.meter import MaxMeter, BatchAvgMeter, Meaner, MinMeter
 from ..utils.memory import occupy_mem
-from ..generator.codebert import Generator
+from ..generator import Generator
 from ..discriminator import Discriminator
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ class DisTrainer(Trainer):
             args.src_max_len,
             args.tgt_max_len,
             args.vocab_size,
-            args.cnn_hidden_size,
+            args.dis_hidden_size,
         )
 
         if load_path:
@@ -162,7 +162,7 @@ class DisTrainer(Trainer):
         parser.add_argument('--gen_num_test_batchs', type=int, default=200)
         parser.add_argument('--gen_beam_search', action='store_true')
 
-        parser.add_argument("--cnn_hidden_size", type=int, default=768)
+        parser.add_argument("--dis_hidden_size", type=int, default=768)
 
 
 if __name__ == '__main__':

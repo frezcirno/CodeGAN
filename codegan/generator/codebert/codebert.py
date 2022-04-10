@@ -27,7 +27,7 @@ def mask_target(target_ids: Tensor) -> Tuple[Tensor, Tensor]:
     return target_ids, mask
 
 
-class Generator(nn.Module):
+class CodeBert(nn.Module):
     """
         Generator model, robert + transformer
 
@@ -46,7 +46,7 @@ class Generator(nn.Module):
         beam_size: int,
         max_length: int,
     ):
-        super(Generator, self).__init__()
+        super().__init__()
         self.encoder = RobertaModel.from_pretrained("microsoft/codebert-base")
         self.decoder = TransformerDecoder(hidden_size)
         self.hidden_size = hidden_size
@@ -158,10 +158,12 @@ class Generator(nn.Module):
 
     def forward(
         self,
-        source_ids,
-        source_mask,
+        source_ids=None,
+        source_mask=None,
         target_ids=None,
         target_mask=None,
+        memory=None,
+        memory_key_padding_mask=None,
         rewards=None,
         init_given_num=None,
         beam_search=False,
@@ -172,20 +174,26 @@ class Generator(nn.Module):
         else -> greedy_predict
         """
         if init_given_num is not None:
-            return self.rollout_predict(source_ids, source_mask, target_ids, init_given_num)
+            if memory is None:
+                memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
+            return self.rollout_predict(memory, memory_key_padding_mask, target_ids, init_given_num)
 
         if rewards is not None:
-            return self.gan_get_loss(source_ids, source_mask, target_ids, rewards)
+            if memory is None:
+                memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
+            return self.gan_get_loss(memory, memory_key_padding_mask, target_ids, rewards)
 
         if target_mask is not None:
-            return self.get_loss(source_ids, source_mask, target_ids, target_mask)
+            if memory is None:
+                memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
+            return self.get_loss(memory, memory_key_padding_mask, target_ids, target_mask)
 
         if beam_search:
             return self.beam_predict(source_ids, source_mask)
 
         return self.predict(source_ids, source_mask)
 
-    def get_loss(self, source_ids, source_mask, target_ids, target_mask):
+    def get_loss(self, memory, memory_key_padding_mask, target_ids, target_mask):
         """
         Inputs:
             source_ids: [batch_size x src_max_len]
@@ -204,7 +212,6 @@ class Generator(nn.Module):
         """
 
         # [batch_size x src_max_len x args.hidden_size]
-        memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
         lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)
         lm_logits = F.softmax(lm_logits, dim=1)
 
@@ -336,7 +343,7 @@ class Generator(nn.Module):
 
     def rollout_predict(
         self,
-        source_ids, source_mask, init_target_ids, init_given_num
+        memory, memory_key_padding_mask, init_target_ids, init_given_num
     ):
         """
         Predict like self.predict(), but
@@ -352,13 +359,11 @@ class Generator(nn.Module):
             target_ids: [batch_size x max_length]
             target_mask: [batch_size x max_length]
         """
-        context, memory_key_padding_mask = self.encode(source_ids, source_mask)
-
         target_ids = init_target_ids[:, :init_given_num]
 
         for _ in range(init_given_num, self.max_length):
             # [batch_size x i]
-            last_logit = self.decode_last(target_ids, context, memory_key_padding_mask)
+            last_logit = self.decode_last(target_ids, memory, memory_key_padding_mask)
             last_logit = F.softmax(last_logit, dim=1)
             # [batch_size x vocab_size]
             pred = torch.multinomial(last_logit, 1)  # sampling one sample
@@ -381,7 +386,7 @@ class Generator(nn.Module):
             loss: (sum of a batch)
         """
         lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)  # [batch_size x tgt_max_len x vocab_size]
-        lm_logits = F.log_softmax(lm_logits)
+        lm_logits = F.log_softmax(lm_logits, dim=2)
         shift_logits = lm_logits[:, :-1, :]
         # [batch_size x tgt_max_len-1 x vocab_size]
 

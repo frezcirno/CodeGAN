@@ -23,7 +23,7 @@ from .utils import Trainer, add_general_arguments, eval_gen_bleu, eval_gen_loss,
 from ..utils import occupy_mem, set_seed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
 from ..utils.dist import is_distributed, local_rank, rank, world_size
-from ..generator.codebert import Generator
+from ..generator import Generator
 
 logger = logging.getLogger(__name__)
 

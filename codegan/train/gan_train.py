@@ -9,14 +9,18 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch import Tensor
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
-from ..generator.codebert import Generator
+from codegan.train.gen_train import GenTrainer
+
+from ..generator import Generator
 from ..discriminator import Discriminator
 from ..utils import set_seed
 from ..tokenize import tensors_to_text
 from ..utils.dist import is_distributed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
+from .. import tokenize
 from .common import load_dataset
 from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_gen_bleu, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 
@@ -44,11 +48,9 @@ class GanTrainer(Trainer):
 
         self.device = device
 
-        self.dis = Discriminator(args.src_max_len, args.tgt_max_len, args.vocab_size, args.hidden_size)
+        self.dis = Discriminator(args.src_max_len, args.tgt_max_len, args.vocab_size, args.dis_hidden_size)
 
-        for p in self.dis.src_embedding.parameters():
-            p.requires_grad = False
-        for p in self.dis.tgt_embedding.parameters():
+        for p in self.dis.embedding.parameters():
             p.requires_grad = False
 
         if dis_load_path:
@@ -70,19 +72,17 @@ class GanTrainer(Trainer):
         self.best_loss = MinMeter()
         self.best_bleu = MaxMeter()
 
-        self.epoch = -1
+    def to_gen_device(self, x: Tensor):
+        return x.to(self.device)
 
-    def to_gen_device(self, x):
-        return x.to(self.gen_device)
-
-    def to_dis_device(self, x):
+    def to_dis_device(self, x: Tensor):
         return x.to(self.dis_device)
 
     def gen_to_cpu(self):
         self.model.to("cpu")
 
     def gen_to_gpu(self):
-        self.model.to(self.gen_device)
+        self.model.to(self.device)
 
     def dis_to_cpu(self):
         self.dis.to("cpu")
@@ -124,34 +124,35 @@ class GanTrainer(Trainer):
                 rewards[i][0] is empty
                 rewards[i][j]: the reward of using word Seq[j] as the next of Seq[0..j-1].
         """
+        self.dis_eval()
         batch_size = source_ids.size(0)
 
-        rewards = torch.zeros(
-            self.args.tgt_max_len, batch_size, dtype=torch.float, device=self.dis_device
-        )
-        self.dis_eval()
-        for _ in range(rollnum):  # rollout times, mean() later
-            # ignore bos_token
-            for init_given_num in range(2, self.args.tgt_max_len):
+        rewards = torch.zeros(self.args.tgt_max_len, batch_size,
+                              dtype=torch.float, device=self.dis_device)
+        with torch.no_grad():
+            model = getattr(self.model, 'module', self.model)
+            memory, memory_key_padding_mask = model.encode(source_ids, source_mask)
+            for init_given_num in range(2, self.args.tgt_max_len): # ignore bos_token
                 if not any(pre_target_mask[:, init_given_num]):
                     break
-                target_ids, _ = self.model(
-                    source_ids, source_mask, pre_target_ids,
-                    init_given_num=init_given_num,
-                )
-                with torch.no_grad():
+                init_target_ids = pre_target_ids[:, :init_given_num]
+                for _ in range(rollnum):  # rollout times, mean() later
+                    target_ids, _ = self.model(
+                        memory=memory,
+                        memory_key_padding_mask=memory_key_padding_mask,
+                        target_ids=init_target_ids,
+                        init_given_num=init_given_num,
+                    )
                     # pred: [0-1] prods
                     pred = self.dis(self.to_dis_device(source_ids),
                                     self.to_dis_device(target_ids))
-                # pred = pred.cpu()
-                rewards[init_given_num - 1] += pred
+                    # pred = pred.cpu()
+                    rewards[init_given_num - 1] += pred
 
-            with torch.no_grad():
-                pred = self.dis(self.to_dis_device(source_ids),
-                                self.to_dis_device(pre_target_ids))
-            # pred = pred.cpu()
             # [batch_size]
-            rewards[self.args.tgt_max_len - 1] += pred
+            pred = self.dis(self.to_dis_device(source_ids),
+                            self.to_dis_device(pre_target_ids))
+            rewards[self.args.tgt_max_len - 1] += pred * rollnum
 
         # rewards: [batch_size x tgt_max_len]
         rewards = rewards.transpose(1, 0).contiguous()
@@ -182,28 +183,28 @@ class GanTrainer(Trainer):
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.args.weight_decay,
+                "weight_decay": self.weight_decay,
             },
             {
                 "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
                 "weight_decay": 0.0,
             },
         ]
-        self.opt = AdamW(
+        self.opt = optim.AdamW(
             optimizer_grouped_parameters,
-            lr=self.args.gen_learning_rate,
-            eps=self.args.gen_adam_epsilon,
+            lr=self.learning_rate,
+            eps=self.adam_epsilon,
         )
 
-        t_total = self.args.g_steps * self.args.gan_train_epochs
+        t_total = self.args.g_steps * self.train_epochs
         if self.args.teach:
             t_total = t_total * 2
 
         logger.info("+ Total train steps = %d", t_total)
         logger.info("+ Warmup steps = %d", int(t_total * 0.1))
 
-        self.sch = get_linear_schedule_with_warmup(
-            self.opt, num_warmup_steps=int(t_total * 0.1), num_training_steps=t_total)
+        self.sch = get_linear_schedule_with_warmup(self.opt, num_warmup_steps=int(t_total * 0.1),
+                                                   num_training_steps=t_total)
 
     def __prepare_optimizer_dis(self):
         self.dis_opt = optim.Adam(
@@ -217,11 +218,18 @@ class GanTrainer(Trainer):
         source_mask = self.to_gen_device(batch[1])
 
         pre_target_ids, pre_target_mask = self.model(source_ids, source_mask)
-        rewards = self.get_reward(source_ids, source_mask,
-                                  pre_target_ids, pre_target_mask,
-                                  rollnum=self.args.rollnum)
+        rewards = self.get_reward(
+            source_ids, source_mask,
+            pre_target_ids, pre_target_mask,
+            rollnum=self.args.rollnum
+        )
         # get pg_loss
-        loss = self.model(source_ids, source_mask, pre_target_ids, rewards=rewards)
+        loss: Tensor = self.model(
+            source_ids=source_ids,
+            source_mask=source_mask,
+            target_ids=pre_target_ids,
+            rewards=rewards
+        )
 
         if loss.size():
             loss = loss.mean()
@@ -239,11 +247,10 @@ class GanTrainer(Trainer):
         target_ids = self.to_gen_device(batch[2])
         target_mask = self.to_gen_device(batch[3])
 
-        context, memory_key_padding_mask = self._gen.get_context(source_ids, source_mask)
         # [batch_size x source_length x args.hidden_size]
 
         rewards = torch.ones_like(target_ids) * target_mask
-        tloss = self.model(context, memory_key_padding_mask, target_ids, rewards=rewards)
+        tloss = self.model(source_ids, source_mask, target_ids, rewards=rewards)
 
         if tloss.size():
             tloss = tloss.mean()
@@ -332,7 +339,7 @@ class GanTrainer(Trainer):
             # (re)generate fake dataset
             self.gen_to_gpu()
             train_dataset = fakegen2(self.model, self.device, train_dataset,
-                                     self.gen_num_batchs, self.gen_batch_size,
+                                     self.gen_num_train_batchs, self.gen_batch_size,
                                      self.gen_beam_search, self.num_workers)
             self.gen_to_cpu()
 
@@ -340,7 +347,7 @@ class GanTrainer(Trainer):
             self.train_step_dis(train_dataset)
             self.dis_to_cpu()
 
-    def train(self, train_dataset, valid_dataset, bleu_dataset):
+    def train(self, train_dataset, valid_dataset, test_dataset):
         self.__prepare_optimizer_gen()
         self.__prepare_optimizer_dis()
         # '''
@@ -348,26 +355,26 @@ class GanTrainer(Trainer):
         # but that's very slow. So a subset is used. The subset won't change
         # with d-step.
         # '''
-        # train_subset = SamplingSubset(train_dataset, self.args.gen_num_batchs * self.args.gen_batch_size)
+        # train_subset = SamplingSubset(train_dataset, self.args.gen_num_train_batchs * self.args.gen_batch_size)
 
         '''
         Change data for pg train every epoch.
         '''
         if is_distributed():
-            gan_train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            sampler = DistributedSampler(train_dataset, shuffle=True)
         else:
-            gan_train_sampler = RandomSampler(train_dataset)
+            sampler = RandomSampler(train_dataset)
 
-        gan_dataloader = DataLoader(
+        dataloader = DataLoader(
             train_dataset,
-            batch_size=self.args.gan_batch_size,
+            batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            sampler=gan_train_sampler,
+            sampler=sampler,
         )
-        train_iter = iter(gan_dataloader)
+        train_iter = iter(dataloader)
 
-        for self.epoch in trange(self.args.gan_train_epochs, desc="Epoch"):
+        for self.epoch in trange(self.train_epochs, desc="Epoch"):
             # Not need, because one epoch here doesn't exhaust all samples
             # if is_distributed():
             #     gan_train_sampler.set_epoch(self.epoch)
@@ -375,29 +382,26 @@ class GanTrainer(Trainer):
             self.train_epoch_dis(train_dataset)
             self.save_checkpoint('latest')
 
-            self.eval_epoch(valid_dataset, bleu_dataset)
+            self.eval_epoch(valid_dataset, test_dataset)
 
-    def eval(self, valid_dataset, bleu_dataset):
+    def eval(self, valid_dataset, test_dataset):
         self.dis_to_cpu()
-        self.gen_eval()
         self.gen_to_gpu()
+
         self.eval_loss(valid_dataset)
-        self.eval_bleu(bleu_dataset)
+        self.eval_bleu(test_dataset)
+
         self.eval_dis_acc(valid_dataset)
 
-    def eval_dis_acc(self, valid_dataset):
-        dis_valid_dataset = fakegen(
-            self.args,
-            valid_dataset,
-            self.args.dis_valid_sample,
-            self._gen,
-            train=False,
-        )
+    def eval_dis_acc(self, test_dataset):
+        test_dataset = fakegen2(self.model, self.device, test_dataset,
+                                self.gen_num_test_batchs, self.gen_batch_size,
+                                self.gen_beam_search, self.num_workers)
 
         return eval_dis_acc(
             self.dis,
             self.dis_device,
-            valid_dataset,
+            test_dataset,
             self.eval_batch_size,
             self.num_workers,
         )
@@ -418,7 +422,7 @@ class GanTrainer(Trainer):
         if self.best_bleu.is_best():
             self.save_checkpoint('best_bleu', best_bleu)
 
-        self.eval_dis_acc(valid_dataset)
+        self.eval_dis_acc(test_dataset)
 
     def eval_loss(self, valid_dataset):
         # Eval G with dev dataset
@@ -446,17 +450,28 @@ class GanTrainer(Trainer):
         )
 
     @classmethod
-    def add_argument(cls, parser):
+    def add_arguments(cls, parser):
+        GenTrainer.add_arguments(parser)
+
+        # --load_path is reserved for the main model (the G)
+        parser.add_argument('--dis_load_path', type=str)
+        parser.add_argument("--dis_hidden_size", type=int, default=768)
+        parser.add_argument("--dis_learning_rate", type=float, default=5e-5)
+        parser.add_argument("--dis_adam_epsilon", type=float, default=1e-8)
+        parser.add_argument("--dis_weight_decay", type=float, default=0.0)
+
         parser.add_argument("--rollnum", type=int, default=20)
         parser.add_argument("--g_steps", type=int, default=100, help="Generator train steps, one batch one step.")
         parser.add_argument("--teach", action="store_true", help="Use teacher forcing after every step.")
         parser.add_argument("--d_steps", type=int, default=5,
                             help="Discriminator train steps, do gan_d_sample x d_epochs samples one step.")
-        parser.add_argument("--d_epochs", type=int, default=6)
+        parser.add_argument('-k', "--d_epochs", type=int, default=6)
         parser.add_argument('--d_batch_size', type=int, default=32)
 
         parser.add_argument('--gen_batch_size', type=int, default=256)
-        parser.add_argument('--gen_num_batchs', type=int, default=2000)
+        parser.add_argument('--gen_num_train_batchs', type=int, default=2000)
+        parser.add_argument('--gen_num_valid_batchs', type=int, default=200)
+        parser.add_argument('--gen_num_test_batchs', type=int, default=200)
         parser.add_argument('--gen_beam_search', action='store_true')
 
 
@@ -489,5 +504,5 @@ if __name__ == '__main__':
     logger.info("valid dataset: %d samples", len(valid_dataset))
     logger.info("test dataset: %d samples", len(test_dataset))
 
-    trainer = GanTrainer(args, run_dir, args.load_path, _device)
+    trainer = GanTrainer(args, run_dir, args.load_path, args.dis_load_path, _device, _device)
     trainer.run(train_dataset, valid_dataset, test_dataset)
