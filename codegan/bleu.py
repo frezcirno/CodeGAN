@@ -201,14 +201,20 @@ def bleuFromMaps(m1, m2):
 
 
 def write_output(output_file, gold_file, predicts, golds):
-    predictions = []
-
     with open(output_file, "w") as f, open(gold_file, "w") as fgold:
         for i, (pred, gold) in enumerate(zip(predicts, golds)):
             stridx = str(i)
-            predictions.append(stridx + "\t" + pred)
             f.write(stridx + "\t" + pred + "\n")
             fgold.write(stridx + "\t" + gold + "\n")
+    return get_predictions(predicts)
+
+
+def get_predictions(predicts):
+    predictions = []
+
+    for i, pred in enumerate(predicts):
+        stridx = str(i)
+        predictions.append(stridx + "\t" + pred)
     return predictions
 
 

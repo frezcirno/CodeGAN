@@ -23,15 +23,16 @@ from torch.utils.data import (
     ConcatDataset,
     SequentialSampler,
 )
+from nlgeval import compute_metrics
 from torch.utils.data.distributed import DistributedSampler
-from codegan.utils.memory import occupy_mem
-# from torch.utils.tensorboard import SummaryWriter
-from .. import bleu, tokenize
-from ..utils.meter import BatchAvgMeter
-from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
-from ..utils.dataset import CombineDataset, ConstDataset, SelectDataset
-from ..tokenize import str_to_ids, tensors_to_text
 
+from codegan import bleu
+# from torch.utils.tensorboard import SummaryWriter
+from .. import tokenize
+from ..utils.cache import cache_result
+from ..utils.memory import occupy_mem
+from ..utils.meter import BatchAvgMeter, MinMeter
+from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
 logger = logging.getLogger(__name__)
 
 # writer = SummaryWriter()
@@ -39,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 def to_features(df: pd.DataFrame) -> pd.DataFrame:
     def make_features(s: pd.Series):
-        code_tokens, code_ids = str_to_ids(s['code'])
-        doc_tokens, doc_ids = str_to_ids(s['docstring'])
+        code_tokens, code_ids = tokenize.str_to_ids(s['code'])
+        doc_tokens, doc_ids = tokenize.str_to_ids(s['docstring'])
 
         return {
             "code_tokens": code_tokens,
@@ -81,8 +82,8 @@ def save_model(model, path):
     if is_distributed() and not is_master():
         return
 
-    # Only save the model it-self
-    model_to_save = model.module if hasattr(model, "module") else model
+    # Only save the model itself
+    model_to_save = getattr(model, "module", model)
     dirname = os.path.dirname(path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -141,49 +142,14 @@ def fakegen2(
     Outputs:
         dataset: [source_ids, target_ids, labels]
     """
-    if is_distributed():
-        sampler = DistributedSampler(dataset, drop_last=True)
-    else:
-        sampler = SequentialSampler(dataset)
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        sampler=sampler,
-    )
+    dataloader, sampler = eval_dataloader(dataset, batch_size, num_workers)
 
     dataset = make_gan_dataset(gen, device, dataloader, num_batchs=num_batchs, beam_search=beam_search)
     if is_distributed():
-        datasets = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(datasets, dataset)
-        tensors = [dataset.tensors for dataset in datasets]
+        tensors = gather_all(dataset.tensors)
         return TensorDataset(*[torch.cat(ts) for ts in zip(*tensors)])
     else:
         return dataset
-
-
-def mix_dataset(real_dataset, fake_dataset, keep_col=[0, 1, 2]):
-    """
-    Combine two dataset.
-
-    Input:
-        real_dataset: (source_ids, source_mask, target_ids, target_mask)
-        fake_dataset: (source_ids, source_mask, target_ids)
-    Output:
-        mixed_dataset: (source_ids, source_mask, target_ids, label)
-    """
-    real_dataset = CombineDataset(
-        SelectDataset(real_dataset, keep_col),
-        ConstDataset(torch.tensor(1.0), len(real_dataset))
-    )
-    fake_dataset = CombineDataset(
-        SelectDataset(fake_dataset, keep_col),
-        ConstDataset(torch.tensor(0.0), len(fake_dataset))
-    )
-
-    return ConcatDataset([real_dataset, fake_dataset])
 
 
 class EarlyStopping:
@@ -233,72 +199,50 @@ def is_notebook():
         return False  # Probably standard Python interpreter
 
 
-def fakegen(args, dataset, num_samples, _gen, train=True):
-    '''when in distributed, every process will generate and return a part of the mixed data'''
-    if train:
-        if is_distributed():
-            indices = torch.randperm(len(dataset))[:num_samples]
-            subset = Subset(dataset, indices)
-            sampler = DistributedSampler(subset, shuffle=True, drop_last=True)
-        else:
-            indices = torch.randperm(len(dataset))[:num_samples]
-            sampler = SubsetRandomSampler(indices)
-    else:
-        indices = torch.randperm(len(dataset))[:num_samples]
-        dataset = Subset(dataset, indices)
-        sampler = SequentialSampler(dataset)
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.fakegen_batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        sampler=sampler,
-    )
-    logger.info("+ make dataset for gan %s: batch_size = %d, num_samples = %d, total samples ~= %d",
-                "train" if train else "eval", args.fakegen_batch_size, num_samples,
-                args.fakegen_batch_size * len(dataloader))
-
-    return make_gan_dataset(_gen, dataloader)
+def write_output(output_file, gold_file, predicts, golds):
+    with open(output_file, "w") as f, open(gold_file, "w") as fgold:
+        for pred, gold in zip(predicts, golds):
+            f.write(pred + "\n")
+            fgold.write(gold + "\n")
 
 
-def eval_gen_bleu(
-    gen,
+def evaluate_metrics(
+    model,
     device,
     dataset,
-    gan_output_file,
-    gan_gold_file,
+    output_file: str,
+    gold_file: str,
     batch_size,
     num_workers=4
 ) -> float:
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    dataloader, sampler = eval_dataloader(dataset, batch_size, num_workers)
     predicts = []
     golds = []
-    with tqdm(dataloader, dynamic_ncols=True) as bar:
-        for batch in bar:
-            source_ids = batch[0]
-            source_mask = batch[1]
-            target_ids = batch[2]
-            with torch.no_grad():
-                preds, _ = gen(source_ids.to(device),
-                               source_mask.to(device), beam_search=True)
-                predicts.extend(tensors_to_text(preds))
-                golds.extend(tensors_to_text(target_ids))
+    with torch.no_grad():
+        with tqdm(dataloader, dynamic_ncols=True) as bar:
+            for batch in bar:
+                source_ids = batch[0]
+                source_mask = batch[1]
+                target_ids = batch[2]
+                preds, _ = model(source_ids.to(device),
+                                 source_mask.to(device), beam_search=True)
+                predicts.extend(tokenize.tensors_to_text(preds))
+                golds.extend(tokenize.tensors_to_text(target_ids))
 
-    predictions = bleu.write_output(
-        gan_output_file,
-        gan_gold_file,
-        predicts,
-        golds,
-    )
+    if is_distributed():
+        predicts = sum(gather_all(predicts), [])
+        golds = sum(gather_all(golds), [])
 
-    goldMap, predictionMap = bleu.computeMaps(predictions, gan_gold_file)
-    return bleu.bleuFromMaps(goldMap, predictionMap)[0]
+    write_output(output_file, gold_file, predicts, golds)
+
+    metrics = compute_metrics(hypothesis=output_file, references=[gold_file],
+                              no_skipthoughts=True, no_glove=True)
+
+    predictions = bleu.write_output(output_file, gold_file, predicts, golds)
+    goldMap, predictionMap = bleu.computeMaps(predictions, gold_file)
+    metrics['bleu4'] = bleu.bleuFromMaps(goldMap, predictionMap)[0]
+
+    return metrics
 
 
 def eval_gen_loss(
@@ -371,7 +315,7 @@ def eval_dis_loss(
 
 
 def eval_dis_acc(
-    dis: nn.Module,
+    model: nn.Module,
     device: int,
     dataset: TensorDataset,
     batch_size: int,
@@ -391,7 +335,7 @@ def eval_dis_acc(
                 target_ids = batch[1].to(device)
                 labels = batch[2]
 
-                prob = dis(source_ids, target_ids).to("cpu").gt(0.5)
+                prob = model(source_ids, target_ids).to("cpu").gt(0.5)
 
                 right = labels.eq(prob).sum()
                 total = source_ids.size(0)
@@ -421,7 +365,10 @@ def add_general_arguments(parser: argparse.ArgumentParser):
 
 
 class Trainer(object):
-    def __init__(self, args, run_dir):
+    def __init__(self, args, run_dir, device):
+        self.model = None
+        self.device = device
+
         self.do_train = args.do_train
         self.do_eval = args.do_eval
         self.train_epochs = args.train_epochs
@@ -438,6 +385,7 @@ class Trainer(object):
 
         self.run_path = run_dir
         self.paths = {}
+        self.best_loss = MinMeter()
 
     @classmethod
     def build_parallel(
@@ -460,6 +408,15 @@ class Trainer(object):
 
         return model
 
+    def to_model_device(self, x: Tensor):
+        return x.to(self.device)
+
+    def train_dataloader(self, train_dataset):
+        return train_dataloader(train_dataset, self.batch_size, self.num_workers)
+
+    def eval_dataloader(self, dataset):
+        return eval_dataloader(dataset, self.eval_batch_size, self.num_workers)
+
     def run(self, *datasets):
         if self.do_train:
             self.train(*datasets)
@@ -474,7 +431,7 @@ class Trainer(object):
 
     def register_path(self, key, path):
         if key in self.paths:
-            logger.warn(f"{key} always in paths")
+            logger.warn(f"{key} is already in paths")
         self.paths[key] = os.path.join(self.run_path, path)
 
     def get_path(self, key, *args):
@@ -573,3 +530,80 @@ def setup_gpu(device_ids: List[int], occupy=False) -> Tuple[int, List[int]]:
                 occupy_mem(device)
 
     return _device, _device_ids
+
+
+def train_dataloader(train_dataset, batch_size, num_workers):
+    if is_distributed():
+        sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+    else:
+        sampler = RandomSampler(train_dataset)
+
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        sampler=sampler,
+    )
+    return dataloader, sampler
+
+
+def eval_dataloader(dataset, batch_size, num_workers):
+    if is_distributed():
+        sampler = DistributedSampler(dataset, drop_last=True)
+    else:
+        sampler = SequentialSampler(dataset)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        sampler=sampler,
+    )
+    return dataloader, sampler
+
+
+def gather_all(object) -> List:
+    all_objects = [None for _ in range(dist.get_world_size())]
+    if isinstance(object, Tensor):
+        dist.all_gather(all_objects, object)
+    else:
+        dist.all_gather_object(all_objects, object)
+    return all_objects
+
+
+@cache_result("cache/dataset", format="torch")
+def load_dataset(data, src_max_len, tgt_max_len):
+    jd = pd.read_parquet(data)
+
+    feats = to_features(jd)
+
+    pad_feats = pad_features(feats, src_max_len, tgt_max_len)
+
+    train_feats = pad_feats.loc[jd.partition == "train"]
+    valid_feats = pad_feats.loc[jd.partition == "valid"]
+    test_feats = pad_feats.loc[jd.partition == "test"]
+
+    train_dataset = TensorDataset(
+        torch.tensor(np.array(train_feats['code_ids'].to_list())),
+        torch.tensor(np.array(train_feats['code_mask'].to_list())),
+        torch.tensor(np.array(train_feats['doc_ids'].to_list())),
+        torch.tensor(np.array(train_feats['doc_mask'].to_list())),
+    )
+
+    valid_dataset = TensorDataset(
+        torch.tensor(np.array(valid_feats['code_ids'].to_list())),
+        torch.tensor(np.array(valid_feats['code_mask'].to_list())),
+        torch.tensor(np.array(valid_feats['doc_ids'].to_list())),
+        torch.tensor(np.array(valid_feats['doc_mask'].to_list())),
+    )
+
+    test_dataset = TensorDataset(
+        torch.tensor(np.array(test_feats['code_ids'].to_list())),
+        torch.tensor(np.array(test_feats['code_mask'].to_list())),
+        torch.tensor(np.array(test_feats['doc_ids'].to_list())),
+        torch.tensor(np.array(test_feats['doc_mask'].to_list())),
+    )
+
+    return train_dataset, valid_dataset, test_dataset

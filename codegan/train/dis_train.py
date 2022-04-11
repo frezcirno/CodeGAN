@@ -12,16 +12,12 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, Sequ
 
 from .. import tokenize
 from .gen_train import GenTrainer
-from ..utils.cache import cache_result
 
-
-from .common import load_dataset
-from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, validate_device_ids
+from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
 from ..utils import set_seed
+from ..utils.cache import cache_result
 from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
 from ..utils.meter import MaxMeter, BatchAvgMeter, Meaner, MinMeter
-from ..utils.memory import occupy_mem
-from ..generator import Generator
 from ..discriminator import Discriminator
 
 logger = logging.getLogger(__name__)
@@ -29,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class DisTrainer(Trainer):
     def __init__(self, args, run_dir, load_path, device, parallel=True):
-        super().__init__(args, run_dir)
+        super().__init__(args, run_dir, device)
 
         self.model = Discriminator(
             args.src_max_len,
@@ -50,30 +46,24 @@ class DisTrainer(Trainer):
                 device=device
             )
 
-        self.device = device
-
         self.register_path("latest", "dis.bin")
         self.register_path("best_loss", "dis_bestloss_%f.bin")
         self.register_path("best_acc", "dis_bestacc_%f.bin")
 
-        self.best_loss = MinMeter()
         self.best_acc = MaxMeter()
 
     def save_checkpoint(self, type: Literal['latest|best_acc|best_loss'], *args):
         path = self.get_path(type, *args)
         save_model(self.model, path)
 
-    def to_dis_device(self, x):
-        return x.to(self.device)
-
     def train_epoch(self, dataloader):
         self.model.train()
         loss_meter = Meaner()
         with tqdm(dataloader, "BCEloss 00.0000", dynamic_ncols=True) as bar:
             for batch in bar:
-                source_ids = self.to_dis_device(batch[0])
-                target_ids = self.to_dis_device(batch[1])
-                labels = self.to_dis_device(batch[2])
+                source_ids = self.to_model_device(batch[0])
+                target_ids = self.to_model_device(batch[1])
+                labels = self.to_model_device(batch[2])
 
                 prob = self.model(source_ids, target_ids)
                 loss = F.binary_cross_entropy(prob, labels, reduction='sum')
@@ -89,31 +79,16 @@ class DisTrainer(Trainer):
                 bar.set_description(f"BCEloss {avg_loss:.4f}")
 
     def prepare_optimizer(self):
-        self.opt = optim.Adam(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            eps=self.adam_epsilon,
-            weight_decay=self.weight_decay,
-        )
+        self.opt = optim.Adam(self.model.parameters(), lr=self.learning_rate,
+                              eps=self.adam_epsilon, weight_decay=self.weight_decay)
 
     def train(self, train_dataset, valid_dataset, test_dataset):
         self.prepare_optimizer()
 
-        if is_distributed():
-            sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-        else:
-            sampler = RandomSampler(train_dataset)
-
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            sampler=sampler,
-        )
+        dataloader, sampler = self.train_dataloader(train_dataset)
 
         for self.epoch in range(self.train_epochs):
-            logger.info(f"epoch {self.epoch}")
+            logger.info("epoch %d", self.epoch)
 
             if is_distributed():
                 sampler.set_epoch(self.epoch)

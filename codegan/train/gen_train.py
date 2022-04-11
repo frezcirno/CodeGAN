@@ -17,8 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AdamW, get_linear_schedule_with_warmup
 
-from .common import load_dataset
-from .utils import Trainer, add_general_arguments, eval_gen_bleu, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, validate_device_ids
+from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
 from ..utils import occupy_mem, set_seed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
 from ..utils.dist import is_distributed, local_rank, rank, world_size
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 class GenTrainer(Trainer):
     def __init__(self, args, run_dir, load_path, device, parallel=True):
-        super().__init__(args, run_dir)
+        super().__init__(args, run_dir, device)
 
         self.args = args
         self.model = Generator(
@@ -47,15 +46,9 @@ class GenTrainer(Trainer):
         if parallel:
             self.model = self.build_parallel(self.model, False, device)
 
-        self.device = device
-
         self.prepare_checkpoints()
 
-        self.best_loss = MinMeter()
         self.best_bleu = MaxMeter()
-
-    def to_model_device(self, x):
-        return x.to(self.device)
 
     def prepare_optimizer(self):
         # TODO: Prepare optimizer and schedule (linear warmup and decay)
@@ -131,31 +124,13 @@ class GenTrainer(Trainer):
 
     def train(self, train_dataset, valid_dataset, test_dataset):
         # Start training
-        logger.info("Do train generator:")
-        logger.info("+ train_dataset = %d", len(train_dataset))
-        logger.info("+ Batch size = %d", self.batch_size)
-        logger.info("+ Train epochs = %d", self.train_epochs)
-        logger.info("+ Learning rate = %e", self.learning_rate)
-        logger.info("+ Adam epsilon = %e", self.adam_epsilon)
-
         self.prepare_optimizer()
         self.prepare_scheduler(train_dataset)
 
-        if is_distributed():
-            sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-        else:
-            sampler = RandomSampler(train_dataset)
-
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            sampler=sampler,
-        )
+        dataloader, sampler = self.train_dataloader(train_dataset)
 
         for self.epoch in range(self.train_epochs):
-            logger.info(f"epoch {self.epoch}")
+            logger.info("epoch %d", self.epoch)
             if is_distributed():
                 sampler.set_epoch(self.epoch)
             self.train_epoch(dataloader)
@@ -166,8 +141,8 @@ class GenTrainer(Trainer):
     def eval(self, train_dataset, valid_dataset, test_dataset):
         loss = self.eval_loss(valid_dataset)
         logger.info(f"+ Eval loss: {loss:.5f}")
-        dev_bleu = self.eval_bleu(test_dataset)
-        logger.info("+ bleu-4 = %f", dev_bleu)
+        metrics = self.eval_metrics(test_dataset)
+        logger.info("+ metrics = %s", metrics)
 
     def eval_epoch(self, valid_dataset, test_dataset):
         loss = self.eval_loss(valid_dataset)
@@ -176,25 +151,29 @@ class GenTrainer(Trainer):
         if self.best_loss.is_best():
             self.save_checkpoint('best_loss', best_loss)
 
-        dev_bleu = self.eval_bleu(test_dataset)
-        logger.info("+ bleu-4 = %f", dev_bleu)
+        metrics = self.eval_metrics(test_dataset)
+        logger.info("+ metrics = %s", metrics)
+        dev_bleu = metrics['bleu4']
         best_bleu = self.best_bleu.update(dev_bleu)
         if self.best_bleu.is_best():
             self.save_checkpoint('best_bleu', best_bleu)
 
-    def eval_loss(self, dataset) -> float:
+    def eval_loss(self, dataset):
+        # Eval G with dev dataset
         self.model.eval()
+
         return eval_gen_loss(
             self.model,
             self.device,
             dataset,
-            self.batch_size,
+            self.eval_batch_size,
             self.num_workers
         )
 
-    def eval_bleu(self, dataset) -> float:
+    def eval_metrics(self, dataset) -> float:
         self.model.eval()
-        return eval_gen_bleu(
+
+        return evaluate_metrics(
             self.model,
             self.device,
             dataset,

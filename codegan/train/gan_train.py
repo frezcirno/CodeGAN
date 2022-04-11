@@ -14,22 +14,20 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, Sequ
 
 from codegan.train.gen_train import GenTrainer
 
+from .. import tokenize
 from ..generator import Generator
 from ..discriminator import Discriminator
 from ..utils import set_seed
-from ..tokenize import tensors_to_text
 from ..utils.dist import is_distributed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
-from .. import tokenize
-from .common import load_dataset
-from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_gen_bleu, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
+from .utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
 
 logger = logging.getLogger(__name__)
 
 
 class GanTrainer(Trainer):
     def __init__(self, args, run_dir, load_path, dis_load_path, device, dis_device, parallel=True):
-        super().__init__(args, run_dir)
+        super().__init__(args, run_dir, device)
 
         self.args = args
         self.model = Generator(args.hidden_size, args.vocab_size, args.beam_size, args.tgt_max_len)
@@ -46,8 +44,6 @@ class GanTrainer(Trainer):
                 device=device
             )
 
-        self.device = device
-
         self.dis = Discriminator(args.src_max_len, args.tgt_max_len, args.vocab_size, args.dis_hidden_size)
 
         for p in self.dis.embedding.parameters():
@@ -61,7 +57,7 @@ class GanTrainer(Trainer):
         if parallel:
             self.dis = self.build_parallel(
                 self.dis,
-                find_unused_parameters=True,
+                find_unused_parameters=False,
                 device=dis_device
             )
 
@@ -69,26 +65,10 @@ class GanTrainer(Trainer):
 
         self.prepare_checkpoint()
 
-        self.best_loss = MinMeter()
         self.best_bleu = MaxMeter()
-
-    def to_gen_device(self, x: Tensor):
-        return x.to(self.device)
 
     def to_dis_device(self, x: Tensor):
         return x.to(self.dis_device)
-
-    def gen_to_cpu(self):
-        self.model.to("cpu")
-
-    def gen_to_gpu(self):
-        self.model.to(self.device)
-
-    def dis_to_cpu(self):
-        self.dis.to("cpu")
-
-    def dis_to_gpu(self):
-        self.dis.to(self.dis_device)
 
     def gen_train(self):
         self.model.train()
@@ -132,7 +112,7 @@ class GanTrainer(Trainer):
         with torch.no_grad():
             model = getattr(self.model, 'module', self.model)
             memory, memory_key_padding_mask = model.encode(source_ids, source_mask)
-            for init_given_num in range(2, self.args.tgt_max_len): # ignore bos_token
+            for init_given_num in range(2, self.args.tgt_max_len):  # ignore bos_token
                 if not any(pre_target_mask[:, init_given_num]):
                     break
                 init_target_ids = pre_target_ids[:, :init_given_num]
@@ -166,14 +146,15 @@ class GanTrainer(Trainer):
         self.register_path("best_loss", "gan_gen_bestloss_%f.bin")
         self.register_path("best_loss_dis", "gan_dis_bestloss_%f.bin")
         self.register_path("best_bleu", "gan_gen_bestbleu_%f.bin")
-        self.register_path("best_bleu_dis", "gan_dis_bestbleu_%f.bin")
+        self.register_path("best_acc_dis", "gan_dis_bestacc_%f.bin")
         self.register_path("bleu_output", "gan_dev_%d.output")
         self.register_path("bleu_gold", "gan_dev_%d.gold")
 
-    def save_checkpoint(self, type: Literal['latest|best_loss|best_bleu'], *args):
+    def save_checkpoint_gen(self, type: Literal['latest|best_loss|best_bleu'], *args):
         path = self.get_path(type, *args)
         save_model(self.model, path)
 
+    def save_checkpoint_dis(self, type: Literal['latest|best_loss|best_acc'], *args):
         dis_path = self.get_path(type + "_dis", *args)
         save_model(self.dis, dis_path)
 
@@ -214,8 +195,8 @@ class GanTrainer(Trainer):
         )
 
     def train_step_gen(self, batch):
-        source_ids = self.to_gen_device(batch[0])
-        source_mask = self.to_gen_device(batch[1])
+        source_ids = self.to_model_device(batch[0])
+        source_mask = self.to_model_device(batch[1])
 
         pre_target_ids, pre_target_mask = self.model(source_ids, source_mask)
         rewards = self.get_reward(
@@ -242,10 +223,10 @@ class GanTrainer(Trainer):
         return loss.item(), source_ids.size(0)
 
     def train_step_gen_tf(self, batch):
-        source_ids = self.to_gen_device(batch[0])
-        source_mask = self.to_gen_device(batch[1])
-        target_ids = self.to_gen_device(batch[2])
-        target_mask = self.to_gen_device(batch[3])
+        source_ids = self.to_model_device(batch[0])
+        source_mask = self.to_model_device(batch[1])
+        target_ids = self.to_model_device(batch[2])
+        target_mask = self.to_model_device(batch[3])
 
         # [batch_size x source_length x args.hidden_size]
 
@@ -297,9 +278,7 @@ class GanTrainer(Trainer):
 
     def train_epoch_gen(self, train_iter):
         # G-steps
-        self.gen_to_gpu()
         self.gen_train()
-        self.dis_to_gpu()
         self.dis_eval()
         g_loss = BatchAvgMeter()
         g_tloss = BatchAvgMeter()
@@ -337,15 +316,11 @@ class GanTrainer(Trainer):
         self.dis_train()
         for d_step in trange(self.args.d_steps, desc="d-step"):
             # (re)generate fake dataset
-            self.gen_to_gpu()
             train_dataset = fakegen2(self.model, self.device, train_dataset,
-                                     self.gen_num_train_batchs, self.gen_batch_size,
-                                     self.gen_beam_search, self.num_workers)
-            self.gen_to_cpu()
+                                     self.args.gen_num_train_batchs, self.args.gen_batch_size,
+                                     self.args.gen_beam_search, self.num_workers)
 
-            self.dis_to_gpu()
             self.train_step_dis(train_dataset)
-            self.dis_to_cpu()
 
     def train(self, train_dataset, valid_dataset, test_dataset):
         self.__prepare_optimizer_gen()
@@ -360,18 +335,7 @@ class GanTrainer(Trainer):
         '''
         Change data for pg train every epoch.
         '''
-        if is_distributed():
-            sampler = DistributedSampler(train_dataset, shuffle=True)
-        else:
-            sampler = RandomSampler(train_dataset)
-
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            sampler=sampler,
-        )
+        dataloader, sampler = self.train_dataloader(train_dataset)
         train_iter = iter(dataloader)
 
         for self.epoch in trange(self.train_epochs, desc="Epoch"):
@@ -379,24 +343,27 @@ class GanTrainer(Trainer):
             # if is_distributed():
             #     gan_train_sampler.set_epoch(self.epoch)
             self.train_epoch_gen(train_iter)
-            self.train_epoch_dis(train_dataset)
-            self.save_checkpoint('latest')
+            self.save_checkpoint_gen('latest')
 
-            self.eval_epoch(valid_dataset, test_dataset)
+            self.eval_epoch_gen(valid_dataset, test_dataset)
+
+            self.train_epoch_dis(train_dataset)
+            self.save_checkpoint_dis('latest')
+
+            self.eval_epoch_dis(valid_dataset, test_dataset)
 
     def eval(self, valid_dataset, test_dataset):
-        self.dis_to_cpu()
-        self.gen_to_gpu()
-
-        self.eval_loss(valid_dataset)
-        self.eval_bleu(test_dataset)
-
-        self.eval_dis_acc(valid_dataset)
+        loss = self.eval_loss(valid_dataset)
+        logger.info("+ loss = %f", loss)
+        metrics = self.eval_metrics(test_dataset)
+        logger.info("+ metrics = %s", metrics)
+        acc = self.eval_dis_acc(test_dataset)
+        logger.info("+ Accurary = %f", acc)
 
     def eval_dis_acc(self, test_dataset):
         test_dataset = fakegen2(self.model, self.device, test_dataset,
-                                self.gen_num_test_batchs, self.gen_batch_size,
-                                self.gen_beam_search, self.num_workers)
+                                self.args.gen_num_test_batchs, self.args.gen_batch_size,
+                                self.args.gen_beam_search, self.num_workers)
 
         return eval_dis_acc(
             self.dis,
@@ -406,23 +373,19 @@ class GanTrainer(Trainer):
             self.num_workers,
         )
 
-    def eval_epoch(self, valid_dataset, test_dataset):
-        self.dis_to_cpu()
-        self.gen_to_gpu()
-
+    def eval_epoch_gen(self, valid_dataset, test_dataset):
         loss = self.eval_loss(valid_dataset)
         logger.info(f"+ Eval loss: {loss:.5f}")
         best_loss = self.best_loss.update(loss)
         if self.best_loss.is_best():
-            self.save_checkpoint('best_loss', best_loss)
+            self.save_checkpoint_gen('best_loss', best_loss)
 
-        dev_bleu = self.eval_bleu(test_dataset)
-        logger.info("+ bleu-4 = %f", dev_bleu)
+        metrics = self.eval_metrics(test_dataset)
+        logger.info("+ metrics = %s", metrics)
+        dev_bleu = metrics['bleu4']
         best_bleu = self.best_bleu.update(dev_bleu)
         if self.best_bleu.is_best():
-            self.save_checkpoint('best_bleu', best_bleu)
-
-        self.eval_dis_acc(test_dataset)
+            self.save_checkpoint_gen('best_bleu', best_bleu)
 
     def eval_loss(self, valid_dataset):
         # Eval G with dev dataset
@@ -436,10 +399,17 @@ class GanTrainer(Trainer):
             self.num_workers
         )
 
-    def eval_bleu(self, test_dataset):
+    def eval_epoch_dis(self, valid_dataset, test_dataset):
+        loss = self.eval_dis_acc(test_dataset)
+        logger.info(f"+ Eval loss: {loss:.5f}")
+        best_loss = self.best_loss.update(loss)
+        if self.best_loss.is_best():
+            self.save_checkpoint_dis('best_loss', best_loss)
+
+    def eval_metrics(self, test_dataset):
         self.gen_eval()
 
-        return eval_gen_bleu(
+        return evaluate_metrics(
             self.model,
             self.device,
             test_dataset,

@@ -42,7 +42,7 @@ class MaxMeter(FoldableMeter, HasBestMixin):
         super().__init__(max, -1e6)
 
     def update(self, val):
-        self._is_best = val >= super().get()
+        self._is_best = val >= self.get()
         return super().update(val)
 
 
@@ -51,7 +51,7 @@ class MinMeter(FoldableMeter, HasBestMixin):
         super().__init__(min, 1e6)
 
     def update(self, val):
-        self._is_best = val <= super().get()
+        self._is_best = val <= self.get()
         return super().update(val)
 
 
