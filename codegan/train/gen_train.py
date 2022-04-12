@@ -50,6 +50,13 @@ class GenTrainer(Trainer):
 
         self.best_bleu = MaxMeter()
 
+    @classmethod
+    def modify_weights(cls, weights):
+        if 'encoder.pooler.dense.weight' in weights:
+            del weights['encoder.pooler.dense.weight']
+            del weights['encoder.pooler.dense.bias']
+        return weights
+
     def prepare_optimizer(self):
         # TODO: Prepare optimizer and schedule (linear warmup and decay)
         no_decay = ["bias", "LayerNorm.weight"]

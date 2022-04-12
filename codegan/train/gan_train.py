@@ -11,6 +11,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, SequentialSampler
+from codegan.train.dis_train import DisTrainer
 
 from codegan.train.gen_train import GenTrainer
 
@@ -66,6 +67,12 @@ class GanTrainer(Trainer):
         self.prepare_checkpoint()
 
         self.best_bleu = MaxMeter()
+
+    @classmethod
+    def modify_weights(cls, weights: Tensor) -> Tensor:
+        weights = GenTrainer.modify_weights(weights)
+        weights = DisTrainer.modify_weights(weights)
+        return weights
 
     def to_dis_device(self, x: Tensor):
         return x.to(self.dis_device)

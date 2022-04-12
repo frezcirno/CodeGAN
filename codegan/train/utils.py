@@ -453,17 +453,16 @@ class Trainer(object):
         parser.add_argument("--load_path", help="The path to the generator model")
 
     @classmethod
+    def modify_weights(cls, weights: Tensor) -> Tensor:
+        """Adopt old weights"""
+        return weights
+
+    @classmethod
     def load_model(cls, raw_model, load_path, map_location):
         logger.info(f"Load model from {load_path}")
         weights: OrderedDict = torch.load(load_path,
                                           map_location=torch.device(map_location))
-        if 'encoder.pooler.dense.weight' in weights:
-            del weights['encoder.pooler.dense.weight']
-            del weights['encoder.pooler.dense.bias']
-        for key in list(weights.keys()):
-            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
-                new_key = f'decoder.{key}'
-                weights[new_key] = weights.pop(key)
+        weights = cls.modify_weights(weights)
         raw_model.load_state_dict(weights)
         return raw_model
 
