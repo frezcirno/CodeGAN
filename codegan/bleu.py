@@ -19,6 +19,7 @@ The reason for breaking the BLEU computation into three phases cook_refs(), cook
 
 
 # Added to bypass NIST-style pre-processing of hyp and ref files -- wade
+
 import xml.sax.saxutils
 import re
 import math
@@ -165,22 +166,22 @@ def splitPuncts(line):
 def computeMaps(predictions, goldfile):
     predictionMap = {}
     goldMap = {}
-    gf = open(goldfile, 'r')
+    with open(goldfile, 'r') as gf:
 
-    for row in predictions:
-        cols = row.strip().split('\t')
-        if len(cols) == 1:
-            rid, pred = cols[0], ''
-        else:
-            rid, pred = cols[0], cols[1]
-        predictionMap[rid] = [splitPuncts(pred.strip().lower())]
+        for row in predictions:
+            cols = row.strip().split('\t')
+            if len(cols) == 1:
+                rid, pred = cols[0], ''
+            else:
+                rid, pred = cols[0], cols[1]
+            predictionMap[rid] = [splitPuncts(pred.strip().lower())]
 
-    for row in gf:
-        rid, pred = row.split('\t')
-        if rid in predictionMap:  # Only insert if the id exists for the method
-            if rid not in goldMap:
-                goldMap[rid] = []
-            goldMap[rid].append(splitPuncts(pred.strip().lower()))
+        for row in gf:
+            rid, pred = row.split('\t')
+            if rid in predictionMap:  # Only insert if the id exists for the method
+                if rid not in goldMap:
+                    goldMap[rid] = []
+                goldMap[rid].append(splitPuncts(pred.strip().lower()))
 
     sys.stderr.write('Total: ' + str(len(goldMap)) + '\n')
     return goldMap, predictionMap

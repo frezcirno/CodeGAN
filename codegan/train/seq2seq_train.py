@@ -58,8 +58,8 @@ class Seq2SeqTrainer(Trainer):
         self.register_path('latest', "seqattn.bin")
         self.register_path('best_loss', "seqattn_bestloss_%f.bin")
         self.register_path('best_bleu', "seqattn_bestbleu_%f.bin")
-        self.register_path('output_file', "seqattn.output")
-        self.register_path('gold_file', "seqattn.gold")
+        self.register_path('output_file', f"seqattn_{local_rank()}.output" if is_distributed() else "seqattn.output")
+        self.register_path('gold_file', f"seqattn_{local_rank()}.gold" if is_distributed() else "seqattn.gold")
 
     def save_checkpoint(self, type: Literal['latest|best_loss|best_bleu'], *args):
         path = self.get_path(type, *args)

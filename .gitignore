@@ -28,12 +28,11 @@ resources/
 .venv
 *.pkl
 *.pt
-/csn/
 .vscode
 *.parquet
 *.csv
 tags
-*.jsonl
+/data
 /ckpts
 *.bin
 *.npy
@@ -42,3 +41,4 @@ tags
 codegan/preprocess/cb_preprocess/dataset.zip
 codegan/preprocess/cb_preprocess/dataset/
 /cache
+tree-sitter-java.so

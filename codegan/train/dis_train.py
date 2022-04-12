@@ -52,14 +52,6 @@ class DisTrainer(Trainer):
 
         self.best_acc = MaxMeter()
 
-    @classmethod
-    def modify_weights(cls, weights):
-        for key in list(weights.keys()):
-            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
-                new_key = f'decoder.{key}'
-                weights[new_key] = weights.pop(key)
-        return weights
-
     def save_checkpoint(self, type: Literal['latest|best_acc|best_loss'], *args):
         path = self.get_path(type, *args)
         save_model(self.model, path)

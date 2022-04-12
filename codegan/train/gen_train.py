@@ -55,6 +55,10 @@ class GenTrainer(Trainer):
         if 'encoder.pooler.dense.weight' in weights:
             del weights['encoder.pooler.dense.weight']
             del weights['encoder.pooler.dense.bias']
+        for key in list(weights.keys()):
+            if key.startswith('decoder') and not key.startswith('decoder.decoder'):
+                new_key = f'decoder.{key}'
+                weights[new_key] = weights.pop(key)
         return weights
 
     def prepare_optimizer(self):
@@ -86,8 +90,8 @@ class GenTrainer(Trainer):
         self.register_path('latest', "gen.bin")
         self.register_path('best_loss', "gen_bestloss_%f.bin")
         self.register_path('best_bleu', "gen_bestbleu_%f.bin")
-        self.register_path('output_file', "gen.output")
-        self.register_path('gold_file', "gen.gold")
+        self.register_path('output_file', f"gen_{local_rank()}.output" if is_distributed() else "gen.output")
+        self.register_path('gold_file', f"gen_{local_rank()}.gold" if is_distributed() else "gen.gold")
 
     def save_checkpoint(self, type: Literal['latest|best_loss|best_bleu'], *args):
         path = self.get_path(type, *args)
