@@ -385,15 +385,15 @@ class CodeBert(nn.Module):
         Outputs:
             loss: (sum of a batch)
         """
-        lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)  # [batch_size x tgt_max_len x vocab_size]
-        lm_logits = F.log_softmax(lm_logits, dim=2)
-        shift_logits = lm_logits[:, :-1, :]
+        logits = self.decode(target_ids, memory, memory_key_padding_mask)  # [batch_size x tgt_max_len x vocab_size]
+        out = F.log_softmax(logits, dim=2)
+        shift_logits = out[:, :-1, :]
         # [batch_size x tgt_max_len-1 x vocab_size]
 
         flat_lm_logits = shift_logits.reshape(-1, shift_logits.size(-1))
-        # [batch_size*tgt_max_len-1 x vocab_size]
-        flat_target_ids = target_ids[..., 1:].reshape(-1)
-        flat_rewards = rewards[..., 1:].reshape(-1)
+        # [batch_size*tgt_max_len-1, vocab_size]
+        flat_target_ids: Tensor = target_ids[..., 1:].reshape(-1)
+        flat_rewards: Tensor = rewards[..., 1:].reshape(-1)
         # [batch_size*tgt_max_len-1]
 
         """
@@ -401,11 +401,18 @@ class CodeBert(nn.Module):
         flat_target_ids[i]: the real next word
         flat_rewards[i]: the reward of using the word
         """
-        loss = torch.tensor(0.0, device=flat_lm_logits.device)
-        for i, vocab in enumerate(flat_lm_logits):
-            choice = flat_target_ids[i]
-            if choice != tokenize.pad_token_id:
-                loss += vocab[choice] * flat_rewards[i]
+        flat_target_ids *= ~flat_target_ids.eq(tokenize.pad_token_id)
+        flat_target_onehot: Tensor = F.one_hot(flat_target_ids, self.vocab_size).float()
+
+        # [batch_size*tgt_max_len-1]
+        chosen_logits = torch.sum(flat_lm_logits * flat_target_onehot, dim=1)
+        loss = torch.sum(chosen_logits * flat_rewards)
+
+        # loss = torch.tensor(0.0, device=flat_lm_logits.device)
+        # for i, vocab in enumerate(flat_lm_logits):
+        #     choice = flat_target_ids[i]
+        #     if choice != tokenize.pad_token_id:
+        #         loss += vocab[choice] * flat_rewards[i]
 
         return -loss
 

@@ -12,9 +12,20 @@ IDENTIFIER_REGEXP = re.compile(r"^[_a-zA-Z][_a-zA-Z0-9]*$")
 
 NUMBER_REGEXP = re.compile(r"^-?(\d+\.?\d*|\.\d+)([eE]-?\d+)?f?$")
 
+JAVA_KEYWORDS = {"abstract", "continue", "for", "new", "switch",
+                 "assert", "default", "goto", "package", "synchronized",
+                 "boolean", "do", "if", "private", "this",
+                 "break", "double", "implements", "protected", "throw",
+                 "byte", "else", "import", "public", "throws",
+                 "case", "enum", "instanceof", "return", "transient",
+                 "catch", "extends", "int", "short", "try",
+                 "char", "final", "interface", "static", "void",
+                 "class", "finally", "long", "strictfp", "volatile",
+                 "const", "float", "native", "super", "while"}
+
 
 def is_identifier(token: str):
-    return bool(re.match(IDENTIFIER_REGEXP, token))
+    return bool(re.match(IDENTIFIER_REGEXP, token)) and token not in JAVA_KEYWORDS
 
 
 def need_camel_split(token: str):

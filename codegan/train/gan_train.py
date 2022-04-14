@@ -19,7 +19,7 @@ from .. import tokenize
 from ..generator import Generator
 from ..discriminator import Discriminator
 from ..utils import set_seed
-from ..utils.dist import is_distributed
+from ..utils.dist import is_distributed, local_rank
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
 from .utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
 
@@ -67,6 +67,7 @@ class GanTrainer(Trainer):
         self.prepare_checkpoint()
 
         self.best_bleu = MaxMeter()
+        self.best_acc = MaxMeter()
 
     @classmethod
     def modify_weights(cls, weights: Tensor) -> Tensor:
@@ -154,8 +155,8 @@ class GanTrainer(Trainer):
         self.register_path("best_loss_dis", "gan_dis_bestloss_%f.bin")
         self.register_path("best_bleu", "gan_gen_bestbleu_%f.bin")
         self.register_path("best_acc_dis", "gan_dis_bestacc_%f.bin")
-        self.register_path("bleu_output", "gan_dev_%d.output")
-        self.register_path("bleu_gold", "gan_dev_%d.gold")
+        self.register_path('output_file', f"gan_{local_rank()}.output" if is_distributed() else "gan.output")
+        self.register_path('gold_file', f"gan_{local_rank()}.gold" if is_distributed() else "gan.gold")
 
     def save_checkpoint_gen(self, type: Literal['latest|best_loss|best_bleu'], *args):
         path = self.get_path(type, *args)
@@ -250,17 +251,12 @@ class GanTrainer(Trainer):
 
         return tloss.item(), source_ids.size(0)
 
-    def train_step_dis(self, train_dataset):
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.args.d_batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-        )
-
+    def train_step_dis(self, dataloader, sampler):
         # Train dis for k epochs
         for d_epoch in trange(self.args.d_epochs, desc="d-step epoch"):
+            if is_distributed():
+                sampler.set_epoch(d_epoch)
+
             loss_meter = BatchAvgMeter()
             with tqdm(dataloader, "BCEloss 0.0000", dynamic_ncols=True) as bar:
                 for batch in bar:
@@ -327,7 +323,9 @@ class GanTrainer(Trainer):
                                      self.args.gen_num_train_batchs, self.args.gen_batch_size,
                                      self.args.gen_beam_search, self.num_workers)
 
-            self.train_step_dis(train_dataset)
+            dataloader, sampler = self.train_dataloader(train_dataset)
+
+            self.train_step_dis(dataloader, sampler)
 
     def train(self, train_dataset, valid_dataset, test_dataset):
         self.__prepare_optimizer_gen()
@@ -407,11 +405,11 @@ class GanTrainer(Trainer):
         )
 
     def eval_epoch_dis(self, valid_dataset, test_dataset):
-        loss = self.eval_dis_acc(test_dataset)
-        logger.info(f"+ Eval loss: {loss:.5f}")
-        best_loss = self.best_loss.update(loss)
-        if self.best_loss.is_best():
-            self.save_checkpoint_dis('best_loss', best_loss)
+        acc = self.eval_dis_acc(test_dataset)
+        logger.info(f"+ D accuracy: {acc:.5f}")
+        best_acc = self.best_acc.update(acc)
+        if self.best_acc.is_best():
+            self.save_checkpoint_dis('best_acc', best_acc)
 
     def eval_metrics(self, test_dataset):
         self.gen_eval()
@@ -420,8 +418,8 @@ class GanTrainer(Trainer):
             self.model,
             self.device,
             test_dataset,
-            self.get_path("bleu_output", self.epoch),
-            self.get_path("bleu_gold", self.epoch),
+            self.get_path("output_file"),
+            self.get_path("gold_file"),
             self.eval_batch_size,
             self.num_workers
         )
