@@ -130,10 +130,11 @@ class CodeBert(nn.Module):
             context: [batch_size x src_max_len x hidden_size]
             memory_key_padding_mask: same as source_mask
         Output:
-            lm_logits: [batch_size x tgt_max_len x vocab_size]
+            logits: [batch_size x tgt_max_len x vocab_size]
         """
         decode_output = self.__decode(target_ids, memory, memory_key_padding_mask)
-        return self.lm_head(self.dense(decode_output).tanh())
+        out = torch.tanh(self.dense(decode_output))
+        return self.lm_head(out)
 
     def decode_last(
         self,
@@ -212,12 +213,11 @@ class CodeBert(nn.Module):
         """
 
         # [batch_size x src_max_len x args.hidden_size]
-        lm_logits = self.decode(target_ids, memory, memory_key_padding_mask)
-        lm_logits = F.softmax(lm_logits, dim=1)
+        logits = self.decode(target_ids, memory, memory_key_padding_mask)
 
         # Truncate
         # [batch_size x (tgt_max_len-1) x vocab_size]
-        shift_logits = lm_logits[:, :-1, :]
+        shift_logits = logits[:, :-1, :]
 
         # Eval bos_token is invalid
         # [(batch_size*(tgt_max_len-1)) ]

@@ -319,11 +319,11 @@ class GanTrainer(Trainer):
         self.dis_train()
         for d_step in trange(self.args.d_steps, desc="d-step"):
             # (re)generate fake dataset
-            train_dataset = fakegen2(self.model, self.device, train_dataset,
-                                     self.args.gen_num_train_batchs, self.args.gen_batch_size,
-                                     self.args.gen_beam_search, self.num_workers)
+            dis_train_dataset = fakegen2(self.model, self.device, train_dataset,
+                                         self.args.gen_num_train_batchs, self.args.gen_batch_size,
+                                         self.args.gen_beam_search, self.num_workers)
 
-            dataloader, sampler = self.train_dataloader(train_dataset)
+            dataloader, sampler = self.train_dataloader(dis_train_dataset)
 
             self.train_step_dis(dataloader, sampler)
 

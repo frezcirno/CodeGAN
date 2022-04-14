@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timedelta
 import logging
 import os
 import random
@@ -518,7 +519,9 @@ def setup_gpu(device_ids: List[int], occupy=False) -> Tuple[int, List[int]]:
             occupy_mem(local_device_id)
 
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend="nccl", init_method='env://')
+        # NCCL_BLOCKING_WAIT should be set
+        os.environ["NCCL_BLOCKING_WAIT"] = "1"
+        torch.distributed.init_process_group(backend="nccl", init_method='env://', timeout=timedelta(hours=12))
 
     else:
         _device_ids = validate_device_ids(device_ids)

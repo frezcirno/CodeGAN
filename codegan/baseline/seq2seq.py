@@ -241,13 +241,13 @@ class Seq2Seq(nn.Module):
             # receive output tensor (predictions) and new hidden state
             # dec_output: Tensor [batch_size, hidden_size]
             # hidden: Tensor # [1, batch_size, hidden_size]
-            dec_output, hidden = self.decoder(dec_input, hidden, enc_output)
+            logits, hidden = self.decoder(dec_input, hidden, enc_output)
 
             # place predictions in a tensor holding predictions for each token
-            outputs.append(dec_output)
+            outputs.append(logits)
 
             # get the highest predicted token from our predictions
-            top1 = dec_output.argmax(1)
+            top1 = logits.argmax(1)
 
             # decide if we are going to use teacher forcing or not
             teacher_forcing = torch.rand(1) < teacher_forcing_ratio
