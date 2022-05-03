@@ -18,7 +18,7 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 
 from codegan.baseline.seq2seq import Seq2Seq
 
-from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
+from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 from ..utils import occupy_mem, set_seed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
 from ..utils.dist import is_distributed, local_rank, rank, world_size
@@ -34,7 +34,7 @@ class Seq2SeqTrainer(Trainer):
         self.model = Seq2Seq(
             args.vocab_size,
             args.embed_size,
-            args.tgt_max_len,
+            args.max_length,
             args.src_hidden_size,
             args.tgt_hidden_size,
             with_attention=args.with_attention,
@@ -150,25 +150,18 @@ class Seq2SeqTrainer(Trainer):
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser):
-        parser.add_argument("--vocab_size", type=int, default=50265)
-        parser.add_argument("--embed_size", type=int, default=256)
-        parser.add_argument("--src_hidden_size", type=int, default=512)
-        parser.add_argument("--tgt_hidden_size", type=int, default=512)
-        parser.add_argument("--with_attention", action="store_true")
         parser.add_argument(
-            "--src_max_len",
-            type=int,
-            default=256,
-            help="The maximum total source sequence length after tokenization. Sequences longer "
-            "than this will be truncated, sequences shorter will be padded.",
-        )
-        parser.add_argument(
-            "--tgt_max_len",
+            "--max_length",
             type=int,
             default=32,
             help="The maximum total target sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded.",
         )
+        parser.add_argument("--vocab_size", type=int, default=50265)
+        parser.add_argument("--embed_size", type=int, default=256)
+        parser.add_argument("--src_hidden_size", type=int, default=512)
+        parser.add_argument("--tgt_hidden_size", type=int, default=512)
+        parser.add_argument("--with_attention", action="store_true")
 
 
 if __name__ == '__main__':
@@ -192,7 +185,7 @@ if __name__ == '__main__':
     _device, _ = setup_gpu(args.device_ids)
     logger.info(f"Using device {_device}")
 
-    train_dataset, valid_dataset, test_dataset = load_dataset(args.data, args.src_max_len, args.tgt_max_len)
+    train_dataset, valid_dataset, test_dataset = torch.load(args.data)
     logger.info("train dataset: %d samples", len(train_dataset))
     logger.info("valid dataset: %d samples", len(valid_dataset))
     logger.info("test dataset: %d samples", len(test_dataset))

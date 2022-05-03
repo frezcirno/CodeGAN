@@ -1,10 +1,5 @@
-import os
 from pathlib import Path
 import pandas as pd
-
-cache_home = os.path.expanduser(
-    os.path.join(os.getenv("XDG_CACHE_HOME", "~/.cache"), "codegan")
-)
 
 
 def read_jsonl(data_dir: str):
@@ -27,8 +22,3 @@ def read_jsonl(data_dir: str):
         sort=False,
         ignore_index=True,
     )
-
-
-def get_cached_file(file: str) -> str:
-    os.makedirs(cache_home, exist_ok=True)
-    return os.path.join(cache_home, file)

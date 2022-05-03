@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pack_sequence
-from .. import tokenize
+import tokenizer
 
 
 def mask_target(target_ids: Tensor) -> Tuple[Tensor, Tensor]:
@@ -16,12 +16,12 @@ def mask_target(target_ids: Tensor) -> Tuple[Tensor, Tensor]:
 
     for i, batch in enumerate(target_ids):
         try:
-            index_of_eos = (batch == tokenize.eos_token_id).nonzero()[0]
+            index_of_eos = (batch == tokenizer.eos_token_id).nonzero()[0]
         except IndexError:
             continue
         mask[i][index_of_eos + 1:] = 0
 
-    target_ids[(1 - mask).bool()] = tokenize.pad_token_id
+    target_ids[(1 - mask).bool()] = tokenizer.pad_token_id
     mask = mask.to(target_ids.device)
     return target_ids, mask
 
@@ -264,7 +264,7 @@ class Seq2Seq(nn.Module):
         loss = F.cross_entropy(
             outputs.reshape(-1, self.vocab_size)[active_loss],
             active_tgt[active_loss],
-            ignore_index=tokenize.pad_token_id,
+            ignore_index=tokenizer.pad_token_id,
             reduction="sum"
         )
 
@@ -296,7 +296,7 @@ class Seq2Seq(nn.Module):
         enc_output, hidden = self.encoder(src)
 
         # first input to the decoder is the <sos> tokens
-        dec_input = torch.full((source_ids.size(0),), tokenize.bos_token_id, device=src.device)  # tgt[0]
+        dec_input = torch.full((source_ids.size(0),), tokenizer.bos_token_id, device=src.device)  # tgt[0]
         hidden = hidden.unsqueeze(0)  # [1, N, H]
 
         for _ in range(1, self.max_length):

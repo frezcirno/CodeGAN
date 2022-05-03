@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .modules import Conv2dHub, Highway
-from .. import tokenize
+import tokenizer
 
 
 class SlimCNN(nn.Module):
@@ -21,7 +21,7 @@ class SlimCNN(nn.Module):
         super().__init__()
 
         # TODO: use different parameters on code and doc?
-        self.embedding = nn.Embedding(vocab_size, hidden_size, tokenize.pad_token_id)
+        self.embedding = nn.Embedding(vocab_size, hidden_size, tokenizer.pad_token_id)
 
         self.src_conv2d = Conv2dHub(src_max_kernel_size, src_max_len, hidden_size)
         self.tgt_conv2d = Conv2dHub(tgt_max_kernel_size, tgt_max_len, hidden_size)

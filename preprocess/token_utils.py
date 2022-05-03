@@ -8,25 +8,6 @@ DOCSTRING_REGEX_TOKENIZER = re.compile(
 
 CAMEL_REGEXP = re.compile(r"([A-Z][a-z0-9]+)")
 
-IDENTIFIER_REGEXP = re.compile(r"^[_a-zA-Z][_a-zA-Z0-9]*$")
-
-NUMBER_REGEXP = re.compile(r"^-?(\d+\.?\d*|\.\d+)([eE]-?\d+)?f?$")
-
-JAVA_KEYWORDS = {"abstract", "continue", "for", "new", "switch",
-                 "assert", "default", "goto", "package", "synchronized",
-                 "boolean", "do", "if", "private", "this",
-                 "break", "double", "implements", "protected", "throw",
-                 "byte", "else", "import", "public", "throws",
-                 "case", "enum", "instanceof", "return", "transient",
-                 "catch", "extends", "int", "short", "try",
-                 "char", "final", "interface", "static", "void",
-                 "class", "finally", "long", "strictfp", "volatile",
-                 "const", "float", "native", "super", "while"}
-
-
-def is_identifier(token: str):
-    return bool(re.match(IDENTIFIER_REGEXP, token)) and token not in JAVA_KEYWORDS
-
 
 def need_camel_split(token: str):
     return token.isalnum() and (not token.isupper() and not token.islower())
@@ -50,27 +31,6 @@ def tokenize_docstring_from_string(docstr: str) -> List[str]:
         for t in DOCSTRING_REGEX_TOKENIZER.findall(docstr)
         if t is not None and len(t) > 0
     ]
-
-
-def is_number_token(token: str):
-    return bool(re.match(NUMBER_REGEXP, token))
-
-
-def is_string_token(token: str):
-    return token.startswith('"')
-
-
-def is_comment_token(token: str) -> bool:
-    token = token.strip()
-    return token.startswith("//") or token.startswith("/*")
-
-
-def test_is_identifier():
-    assert is_identifier("abcAbcABC111") == True
-    assert is_identifier("a") == True
-    assert is_identifier("1") == False
-    assert is_identifier("_") == True
-    assert is_identifier("_1") == True
 
 
 def test_need_camel_split():

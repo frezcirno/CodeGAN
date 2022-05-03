@@ -6,6 +6,7 @@ import random
 from typing import List, Literal, Optional, OrderedDict, Sequence, Tuple
 import numpy as np
 import pandas as pd
+import swifter
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -29,7 +30,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from codegan import bleu
 # from torch.utils.tensorboard import SummaryWriter
-from .. import tokenize
+import tokenizer
 from ..utils.cache import cache_result
 from ..utils.memory import occupy_mem
 from ..utils.meter import BatchAvgMeter, MinMeter
@@ -37,46 +38,6 @@ from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
 logger = logging.getLogger(__name__)
 
 # writer = SummaryWriter()
-
-
-def to_features(df: pd.DataFrame) -> pd.DataFrame:
-    def make_features(s: pd.Series):
-        code_tokens, code_ids = tokenize.str_to_ids(s['code'])
-        doc_tokens, doc_ids = tokenize.str_to_ids(s['docstring'])
-
-        return {
-            "code_tokens": code_tokens,
-            "doc_tokens": doc_tokens,
-            "code_ids": code_ids,
-            "doc_ids": doc_ids,
-        }
-
-    return df.apply(make_features, axis=1, result_type="expand")
-
-
-def padding(ids: Sequence[int], padding_to: int) -> Tuple[List[int], List[int]]:
-    ids = [tokenize.bos_token_id] + list(ids[: padding_to - 2]) + [tokenize.eos_token_id]
-    id_len = len(ids)
-    padding_length = padding_to - id_len
-
-    ids += [tokenize.pad_token_id] * padding_length
-    mask = [1] * id_len + [0] * padding_length
-    return ids, mask
-
-
-def pad_features(df: pd.DataFrame, src_max_len: int, tgt_max_len: int) -> pd.DataFrame:
-    def pad_features(s):
-        code_ids, code_mask = padding(s['code_ids'], src_max_len)
-        doc_ids, doc_mask = padding(s['doc_ids'], tgt_max_len)
-
-        return {
-            "code_ids": code_ids,
-            "code_mask": code_mask,
-            "doc_ids": doc_ids,
-            "doc_mask": doc_mask,
-        }
-
-    return df.apply(pad_features, axis=1, result_type="expand")
 
 
 def save_model(model, path):
@@ -227,8 +188,8 @@ def evaluate_metrics(
                 target_ids = batch[2]
                 preds, _ = model(source_ids.to(device),
                                  source_mask.to(device), beam_search=True)
-                predicts.extend(tokenize.tensors_to_text(preds))
-                golds.extend(tokenize.tensors_to_text(target_ids))
+                predicts.extend(tokenizer.tensors_to_text(preds))
+                golds.extend(tokenizer.tensors_to_text(target_ids))
 
     if is_distributed():
         predicts = sum(gather_all(predicts), [])
@@ -573,39 +534,3 @@ def gather_all(object) -> List:
     else:
         dist.all_gather_object(all_objects, object)
     return all_objects
-
-
-@cache_result("cache/dataset", format="torch")
-def load_dataset(data, src_max_len, tgt_max_len):
-    jd = pd.read_parquet(data)
-
-    feats = to_features(jd)
-
-    pad_feats = pad_features(feats, src_max_len, tgt_max_len)
-
-    train_feats = pad_feats.loc[jd.partition == "train"]
-    valid_feats = pad_feats.loc[jd.partition == "valid"]
-    test_feats = pad_feats.loc[jd.partition == "test"]
-
-    train_dataset = TensorDataset(
-        torch.tensor(np.array(train_feats['code_ids'].to_list())),
-        torch.tensor(np.array(train_feats['code_mask'].to_list())),
-        torch.tensor(np.array(train_feats['doc_ids'].to_list())),
-        torch.tensor(np.array(train_feats['doc_mask'].to_list())),
-    )
-
-    valid_dataset = TensorDataset(
-        torch.tensor(np.array(valid_feats['code_ids'].to_list())),
-        torch.tensor(np.array(valid_feats['code_mask'].to_list())),
-        torch.tensor(np.array(valid_feats['doc_ids'].to_list())),
-        torch.tensor(np.array(valid_feats['doc_mask'].to_list())),
-    )
-
-    test_dataset = TensorDataset(
-        torch.tensor(np.array(test_feats['code_ids'].to_list())),
-        torch.tensor(np.array(test_feats['code_mask'].to_list())),
-        torch.tensor(np.array(test_feats['doc_ids'].to_list())),
-        torch.tensor(np.array(test_feats['doc_mask'].to_list())),
-    )
-
-    return train_dataset, valid_dataset, test_dataset

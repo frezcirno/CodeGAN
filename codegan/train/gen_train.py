@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AdamW, get_linear_schedule_with_warmup
 
-from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
+from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 from ..utils import occupy_mem, set_seed
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
 from ..utils.dist import is_distributed, local_rank, rank, world_size
@@ -35,7 +35,7 @@ class GenTrainer(Trainer):
             args.hidden_size,
             args.vocab_size,
             args.beam_size,
-            args.tgt_max_len,
+            args.max_length,
         )
 
         if load_path:
@@ -197,14 +197,7 @@ class GenTrainer(Trainer):
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser):
         parser.add_argument(
-            "--src_max_len",
-            type=int,
-            default=256,
-            help="The maximum total source sequence length after tokenization. Sequences longer "
-            "than this will be truncated, sequences shorter will be padded.",
-        )
-        parser.add_argument(
-            "--tgt_max_len",
+            "--max_length",
             type=int,
             default=32,
             help="The maximum total target sequence length after tokenization. Sequences longer "
@@ -236,7 +229,7 @@ if __name__ == '__main__':
     _device, _ = setup_gpu(args.device_ids)
     logger.info(f"Using device {_device}")
 
-    train_dataset, valid_dataset, test_dataset = load_dataset(args.data, args.src_max_len, args.tgt_max_len)
+    train_dataset, valid_dataset, test_dataset = torch.load(args.data)
     logger.info("train dataset: %d samples", len(train_dataset))
     logger.info("valid dataset: %d samples", len(valid_dataset))
     logger.info("test dataset: %d samples", len(test_dataset))

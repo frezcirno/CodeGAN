@@ -10,10 +10,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
-from .. import tokenize
+import tokenizer
 from .gen_train import GenTrainer
 
-from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
+from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 from ..utils import set_seed
 from ..utils.cache import cache_result
 from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
@@ -164,7 +164,7 @@ if __name__ == '__main__':
     _device, _ = setup_gpu(args.device_ids, args.occupy)
     logger.info(f"Using device {_device}")
 
-    train_dataset, valid_dataset, test_dataset = load_dataset(args.data, args.src_max_len, args.tgt_max_len)
+    train_dataset, valid_dataset, test_dataset = torch.load(args.data)
 
     @cache_result("cache/dataset_for_dis.bin", format="torch")
     def make_dataset_for_dis(train_dataset, valid_dataset, test_dataset):

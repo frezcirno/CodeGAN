@@ -15,13 +15,13 @@ from codegan.train.dis_train import DisTrainer
 
 from codegan.train.gen_train import GenTrainer
 
-from .. import tokenize
+import tokenizer
 from ..generator import Generator
 from ..discriminator import Discriminator
 from ..utils import set_seed
 from ..utils.dist import is_distributed, local_rank
 from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
-from .utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging, load_dataset
+from .utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +474,7 @@ if __name__ == '__main__':
     _device, _ = setup_gpu(args.device_ids, args.occupy)
     logger.info(f"Using device {_device}")
 
-    train_dataset, valid_dataset, test_dataset = load_dataset(args.data, args.src_max_len, args.tgt_max_len)
+    train_dataset, valid_dataset, test_dataset = torch.load(args.data)
     logger.info("train dataset: %d samples", len(train_dataset))
     logger.info("valid dataset: %d samples", len(valid_dataset))
     logger.info("test dataset: %d samples", len(test_dataset))

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from .roberta import RobertaModel
 from .decoder import TransformerDecoder
-from ... import tokenize
+import tokenizer
 
 
 def mask_target(target_ids: Tensor) -> Tuple[Tensor, Tensor]:
@@ -17,12 +17,12 @@ def mask_target(target_ids: Tensor) -> Tuple[Tensor, Tensor]:
 
     for i, batch in enumerate(target_ids):
         try:
-            index_of_eos = (batch == tokenize.eos_token_id).nonzero()[0]
+            index_of_eos = (batch == tokenizer.eos_token_id).nonzero()[0]
         except IndexError:
             continue
         mask[i][index_of_eos + 1:] = 0
 
-    target_ids[(1 - mask).bool()] = tokenize.pad_token_id
+    target_ids[(1 - mask).bool()] = tokenizer.pad_token_id
     mask = mask.to(target_ids.device)
     return target_ids, mask
 
@@ -229,7 +229,7 @@ class CodeBert(nn.Module):
             shift_logits.reshape(-1, self.vocab_size)[active_loss],
             # [batch_size*(tgt_max_len-1) x vocab_size]
             active_target[active_loss],  # [batch_size*(tgt_max_len-1) ]  (remove bos_token)
-            ignore_index=tokenize.pad_token_id,
+            ignore_index=tokenizer.pad_token_id,
             reduction='sum',
         )
 
@@ -289,11 +289,11 @@ class CodeBert(nn.Module):
             # [beam_size x <=max_length]
 
             best = beam_preds[0]
-            raw = [tokenize.bos_token_id] + [x.item() for x in best]
+            raw = [tokenizer.bos_token_id] + [x.item() for x in best]
             if len(raw) > self.max_length:
                 raw = raw[:self.max_length]
             if len(raw) < self.max_length:
-                raw += [tokenize.eos_token_id] + [tokenize.pad_token_id] * \
+                raw += [tokenizer.eos_token_id] + [tokenizer.pad_token_id] * \
                     (self.max_length - len(raw) - 1)
             preds.append(raw)
 
@@ -323,7 +323,7 @@ class CodeBert(nn.Module):
 
         memory, memory_key_padding_mask = self.encode(source_ids, source_mask)
 
-        target_ids = torch.full((batch_size, 1), tokenize.bos_token_id, dtype=torch.int64, device=device)
+        target_ids = torch.full((batch_size, 1), tokenizer.bos_token_id, dtype=torch.int64, device=device)
 
         # has_end = torch.zeros(batch_size, dtype=torch.bool)
         for _ in range(self.max_length - 1):
@@ -401,7 +401,7 @@ class CodeBert(nn.Module):
         flat_target_ids[i]: the real next word
         flat_rewards[i]: the reward of using the word
         """
-        flat_target_ids *= ~flat_target_ids.eq(tokenize.pad_token_id)
+        flat_target_ids *= ~flat_target_ids.eq(tokenizer.pad_token_id)
         flat_target_onehot: Tensor = F.one_hot(flat_target_ids, self.vocab_size).float()
 
         # [batch_size*tgt_max_len-1]
@@ -411,7 +411,7 @@ class CodeBert(nn.Module):
         # loss = torch.tensor(0.0, device=flat_lm_logits.device)
         # for i, vocab in enumerate(flat_lm_logits):
         #     choice = flat_target_ids[i]
-        #     if choice != tokenize.pad_token_id:
+        #     if choice != tokenizer.pad_token_id:
         #         loss += vocab[choice] * flat_rewards[i]
 
         return -loss
@@ -426,7 +426,7 @@ class Beam(object):
         self.scores: Tensor
         # The outputs at each time-step. [1, beam_size]
         self.nextYs = [torch.zeros(beam_size, dtype=torch.long, device=device)]
-        self.nextYs[0][0] = tokenize.bos_token_id
+        self.nextYs[0][0] = tokenizer.bos_token_id
         # Has EOS topped the beam yet.
         self.eosTop = False
         # Time and k pair for finished. List[Tuple[]]
@@ -460,7 +460,7 @@ class Beam(object):
             # Don't let EOS have children.
             nextY = self.nextYs[-1]
             for i in range(nextY.size(0)):
-                if nextY[i] == tokenize.eos_token_id:
+                if nextY[i] == tokenizer.eos_token_id:
                     beamLk[i] = -1e20
         else:
             beamLk = lsm_logits[0]  # [vocab_size]
@@ -477,11 +477,11 @@ class Beam(object):
         self.nextYs.append(nextY)
 
         for i in range(nextY.size(0)):
-            if nextY[i] == tokenize.eos_token_id:
+            if nextY[i] == tokenizer.eos_token_id:
                 self.finished.append((self.scores[i], len(self.nextYs) - 1, i))
 
         # End condition is when top-of-beam is EOS and no global score.
-        if nextY[0] == tokenize.eos_token_id:
+        if nextY[0] == tokenizer.eos_token_id:
             self.eosTop = True
 
     def done(self):
@@ -497,7 +497,7 @@ class Beam(object):
             nextY = self.nextYs[-1]
             unfinished = [(self.scores[i], len(self.nextYs) - 1, i)
                           for i in range(nextY.size(0))
-                          if nextY[i] != tokenize.eos_token_id]
+                          if nextY[i] != tokenizer.eos_token_id]
             unfinished.sort(key=lambda a: -a[0])
             self.finished += unfinished[: self.beam_size - len(self.finished)]
 
@@ -520,7 +520,7 @@ class Beam(object):
         def f(pred):
             tokens = []
             for tok in pred:
-                if tok == tokenize.eos_token_id:
+                if tok == tokenizer.eos_token_id:
                     break
                 tokens.append(tok)
             return tokens
