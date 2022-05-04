@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from codegan.beam import Beam
 import tokenizer
 
 
@@ -89,12 +90,14 @@ class Transformer(nn.Module):
         dropout=0.5,
         nhead=8,
         dim_feedforward=2048,
+        beam_size=10
     ):
         super().__init__()
 
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.max_length = max_length
+        self.beam_size = beam_size
 
         self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=tokenizer.pad_token_id)
         self.pos_encoder = PositionalEncoding(hidden_size, dropout)
@@ -119,9 +122,13 @@ class Transformer(nn.Module):
         source_mask=None,
         target_ids=None,
         target_mask=None,
+        beam_search=False,
     ):
         if target_mask is not None:
             return self.get_loss(source_ids, source_mask, target_ids, target_mask)
+
+        if beam_search:
+            return self.beam_predict(source_ids, source_mask)
 
         return self.predict(source_ids, source_mask)
 
@@ -224,3 +231,77 @@ class Transformer(nn.Module):
         # [batch_size x max_length x vocab_size]
 
         return mask_target(target_ids)
+
+    def beam_predict(self, source_ids, source_mask, _device=None):
+        """
+        Inputs:
+            source_ids: [batch_size x src_max_len]
+            source_mask: [batch_size x src_max_len]
+
+        Outputs:
+            [batch_size x max_length] (value: id), padded by pad_token_id
+        """
+        src_emb = self.embedding(source_ids)
+        src = self.pos_encoder(src_emb)
+        context = self.encoder(src)
+
+        preds = []
+        batch_size = source_ids.size(0)
+        device = _device if _device else source_ids.device
+
+        # Beam search for every sample
+        for i in range(batch_size):
+            beam = Beam(self.beam_size, source_ids.device)
+            btarget_ids = beam.getCurrentState(source_ids.device)  # [beam_size x 1]
+            # [batch_size x src_max_len x hidden_size]
+            # -> [1 x src_max_len x hidden_size]
+            # -> [beam_size x src_max_len x hidden_size]
+            ctx = context[i: i + 1].repeat(self.beam_size, 1, 1)
+            # [batch_size x src_max_len]
+            # -> [1 x src_max_len]
+            # -> [beam_size x src_max_len]
+            context_mask = source_mask[i: i + 1, :].repeat(self.beam_size, 1)
+            memory_key_padding_mask = (1 - context_mask).bool()
+            # [beam_size x src_max_len]
+            for _ in range(self.max_length):
+                if beam.done():
+                    break
+
+                tgt_emb = self.embedding(btarget_ids)
+                tgt = self.pos_encoder(tgt_emb)
+
+                tgt_mask = self.bias[: btarget_ids.shape[1], : btarget_ids.shape[1]]  # [tgt_len x tgt_len]
+                dec_output = self.decoder(tgt, ctx, tgt_mask, memory_key_padding_mask=memory_key_padding_mask)
+                last_output = dec_output[:, -1, :]
+                last_logits = self.output(last_output)
+
+                lm_logits = F.log_softmax(last_logits, dim=1)  # [beam_size x vocab_size] (value: probs)
+
+                beam.advance(lm_logits.data)
+
+                # generate a word
+                # copy_() - similar to assign
+                btarget_ids.data.copy_(
+                    # index_select() - choose row(0) by indexes
+                    btarget_ids.data.index_select(0, beam.getCurrentOrigin())
+                )
+                btarget_ids = torch.cat([btarget_ids, beam.getCurrentState(source_ids.device)], 1)
+                # [beam_size x i]
+
+            # [beam_size x [n]] (values: token_id)
+            hyp = beam.getHyp(beam.getFinal())
+            # truncate
+            beam_preds = beam.buildTargetTokens(hyp)[: self.beam_size]
+            # [beam_size x <=max_length]
+
+            best = beam_preds[0]
+            raw = [tokenizer.bos_token_id] + [x.item() for x in best]
+            if len(raw) > self.max_length:
+                raw = raw[:self.max_length]
+            if len(raw) < self.max_length:
+                raw += [tokenizer.eos_token_id] + [tokenizer.pad_token_id] * \
+                    (self.max_length - len(raw) - 1)
+            preds.append(raw)
+
+        # [batch_size x max_length] (value: id)
+        return torch.tensor(preds, dtype=torch.int64, device=device), None
