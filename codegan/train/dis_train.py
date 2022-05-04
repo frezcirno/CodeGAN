@@ -98,11 +98,11 @@ class DisTrainer(Trainer):
             self.eval_epoch(valid_dataset, test_dataset)
 
     def eval_epoch(self, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info("+ BCEloss = %f", loss)
-        best_loss = self.best_loss.update(loss)
-        if self.best_loss.is_best():
-            self.save_checkpoint('best_loss', best_loss)
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info("+ BCEloss = %f", loss)
+        # best_loss = self.best_loss.update(loss)
+        # if self.best_loss.is_best():
+        #     self.save_checkpoint('best_loss', best_loss)
 
         acc = self.eval_acc(test_dataset)
         logger.info("+ Accu = %f", acc)
@@ -122,8 +122,8 @@ class DisTrainer(Trainer):
                             self.eval_batch_size, self.num_workers)
 
     def eval(self, train_dataset, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info("+ BCEloss = %f", loss)
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info("+ BCEloss = %f", loss)
         acc = self.eval_acc(test_dataset)
         logger.info("+ Accu = %f", acc)
 

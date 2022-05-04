@@ -104,22 +104,6 @@ def process(
 
     df_counter = len(df)
 
-    # drop the sample if the code contains too many tokens
-    code_tokens_len = df['code_tokens'].map(len)
-    df = df[(3 < code_tokens_len) & (code_tokens_len < 200)]
-
-    new_counter = len(df)
-    print(f"drop samples if the code contains too many tokens: {df_counter} -> {new_counter}")
-    df_counter = new_counter
-
-    # drop the sample if the docstring contains too many tokens
-    docstring_tokens_len = df['docstring_tokens'].map(len)
-    df = df[(4 < docstring_tokens_len) & (docstring_tokens_len < 256)]
-
-    new_counter = len(df)
-    print(f"drop samples if the docstring contains too many tokens: {df_counter} -> {new_counter}")
-    df_counter = new_counter
-
     # Rebuild the code and docstring from tokens
     df['code'] = df['code_tokens'].map(' '.join)
     df['docstring'] = df['docstring_tokens'].map(' '.join)
@@ -157,6 +141,24 @@ def process(
 
     new_counter = len(df)
     print(f"drop the sample if docstring ends with '{{': {df_counter} -> {new_counter}")
+    df_counter = new_counter
+
+    # df.to_parquet("mid.parquet")
+
+    # drop the sample if the code contains too many tokens
+    code_tokens_len = df['code_tokens'].map(len)
+    df = df[(3 < code_tokens_len) & (code_tokens_len <= 950)]
+
+    new_counter = len(df)
+    print(f"drop samples if the code contains too many tokens: {df_counter} -> {new_counter}")
+    df_counter = new_counter
+
+    # drop the sample if the docstring contains too many tokens
+    docstring_tokens_len = df['docstring_tokens'].map(len)
+    df = df[(4 < docstring_tokens_len) & (docstring_tokens_len <= 32)]
+
+    new_counter = len(df)
+    print(f"drop samples if the docstring contains too many tokens: {df_counter} -> {new_counter}")
     df_counter = new_counter
 
     return df

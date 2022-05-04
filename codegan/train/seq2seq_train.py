@@ -99,13 +99,13 @@ class Seq2SeqTrainer(Trainer):
             if is_distributed():
                 sampler.set_epoch(self.epoch)
             self.train_epoch(dataloader)
-            self.save_checkpoint('latest')
+            # self.save_checkpoint('latest')
 
             self.eval_epoch(valid_dataset, test_dataset)
 
     def eval(self, train_dataset, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info(f"+ Eval loss: {loss:.5f}")
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info(f"+ Eval loss: {loss:.5f}")
 
         metrics = self.eval_metrics(test_dataset)
         logger.info("+ metrics = %s", metrics)
@@ -135,11 +135,11 @@ class Seq2SeqTrainer(Trainer):
         )
 
     def eval_epoch(self, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info(f"+ Eval loss: {loss:.5f}")
-        best_loss = self.best_loss.update(loss)
-        if self.best_loss.is_best():
-            self.save_checkpoint('best_loss', best_loss)
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info(f"+ Eval loss: {loss:.5f}")
+        # best_loss = self.best_loss.update(loss)
+        # if self.best_loss.is_best():
+        #     self.save_checkpoint('best_loss', best_loss)
 
         metrics = self.eval_metrics(test_dataset)
         logger.info("+ metrics = %s", metrics)

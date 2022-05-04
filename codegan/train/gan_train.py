@@ -358,8 +358,8 @@ class GanTrainer(Trainer):
             self.eval_epoch_dis(valid_dataset, test_dataset)
 
     def eval(self, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info("+ loss = %f", loss)
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info("+ loss = %f", loss)
         metrics = self.eval_metrics(test_dataset)
         logger.info("+ metrics = %s", metrics)
         acc = self.eval_dis_acc(test_dataset)
@@ -379,11 +379,11 @@ class GanTrainer(Trainer):
         )
 
     def eval_epoch_gen(self, valid_dataset, test_dataset):
-        loss = self.eval_loss(valid_dataset)
-        logger.info(f"+ Eval loss: {loss:.5f}")
-        best_loss = self.best_loss.update(loss)
-        if self.best_loss.is_best():
-            self.save_checkpoint_gen('best_loss', best_loss)
+        # loss = self.eval_loss(valid_dataset)
+        # logger.info(f"+ Eval loss: {loss:.5f}")
+        # best_loss = self.best_loss.update(loss)
+        # if self.best_loss.is_best():
+        #     self.save_checkpoint_gen('best_loss', best_loss)
 
         metrics = self.eval_metrics(test_dataset)
         logger.info("+ metrics = %s", metrics)

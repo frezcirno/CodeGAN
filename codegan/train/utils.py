@@ -41,16 +41,17 @@ logger = logging.getLogger(__name__)
 
 
 def save_model(model, path):
-    if is_distributed() and not is_master():
-        return
+    if not is_distributed() or is_master():
+        # Only save the model itself
+        model_to_save = getattr(model, "module", model)
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        logger.info(f"saving model to {path}")
+        torch.save(model_to_save.state_dict(), path)
 
-    # Only save the model itself
-    model_to_save = getattr(model, "module", model)
-    dirname = os.path.dirname(path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    logger.info(f"saving model to {path}")
-    torch.save(model_to_save.state_dict(), path)
+    if is_distributed():
+        dist.barrier()
 
 
 def make_gan_dataset(gen, device, dataloader,
