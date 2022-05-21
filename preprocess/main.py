@@ -1,6 +1,6 @@
 import argparse
 from . import process
-from codegan.utils.data_utils import read_jsonl
+from utils.data_utils import read_jsonl
 
 parser = argparse.ArgumentParser()
 parser.add_argument("dataset_path", type=str)

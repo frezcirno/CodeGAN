@@ -11,17 +11,16 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, SequentialSampler
-from codegan.train.dis_train import DisTrainer
-
-from codegan.train.gen_train import GenTrainer
+from train.dis_train import DisTrainer
+from train.gen_train import GenTrainer
 
 import tokenizer
-from ..generator import Generator
-from ..discriminator import Discriminator
-from ..utils import set_seed
-from ..utils.dist import is_distributed, local_rank
-from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
-from .utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
+from model.codebert import CodeBert as Generator
+from model.cnn1 import CNNClassifier as Discriminator
+from utils import set_seed
+from utils.dist import is_distributed, local_rank
+from utils.meter import MaxMeter, BatchAvgMeter, MinMeter
+from utils.train_utils import Trainer, add_general_arguments, eval_dis_acc, evaluate_metrics, eval_gen_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -458,9 +457,8 @@ if __name__ == '__main__':
     add_general_arguments(parser)
     Trainer.add_arguments(parser)
     GanTrainer.add_arguments(parser)
-
-    TRAIN_ARGS = '''--help'''.split()
-    args = parser.parse_args(TRAIN_ARGS if is_notebook() else sys.argv[1:])
+    
+    args = parser.parse_args(sys.argv[1:])
 
     logger.info(" ".join(sys.argv))
     logger.info(str(args))

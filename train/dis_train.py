@@ -13,12 +13,12 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler, Sequ
 import tokenizer
 from .gen_train import GenTrainer
 
-from .utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
-from ..utils import set_seed
-from ..utils.cache import cache_result
-from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
-from ..utils.meter import MaxMeter, BatchAvgMeter, Meaner, MinMeter
-from ..discriminator import Discriminator
+from utils.train_utils import Trainer, add_general_arguments, eval_dis_acc, eval_dis_loss, fakegen2, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
+from utils import set_seed
+from utils.cache import cache_result
+from utils.dist import is_distributed, is_master, local_rank, rank, world_size
+from utils.meter import MaxMeter, BatchAvgMeter, Meaner, MinMeter
+from model.cnn1 import CNNClassifier as Discriminator
 
 logger = logging.getLogger(__name__)
 
@@ -148,9 +148,8 @@ if __name__ == '__main__':
     add_general_arguments(parser)
     Trainer.add_arguments(parser)
     DisTrainer.add_arguments(parser)
-
-    TRAIN_ARGS = '''--help'''.split()
-    args = parser.parse_args(TRAIN_ARGS if is_notebook() else sys.argv[1:])
+    
+    args = parser.parse_args(sys.argv[1:])
 
     logger.info(" ".join(sys.argv))
     logger.info(str(args))

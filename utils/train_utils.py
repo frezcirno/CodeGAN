@@ -28,13 +28,13 @@ from torch.utils.data import (
 from nlgeval import compute_metrics
 from torch.utils.data.distributed import DistributedSampler
 
-from codegan import bleu
+import bleu
 # from torch.utils.tensorboard import SummaryWriter
 import tokenizer
-from ..utils.cache import cache_result
-from ..utils.memory import occupy_mem
-from ..utils.meter import BatchAvgMeter, MinMeter
-from ..utils.dist import is_distributed, is_master, local_rank, rank, world_size
+from utils.cache import cache_result
+from utils.memory import occupy_mem
+from utils.meter import BatchAvgMeter, MinMeter
+from utils.dist import is_distributed, is_master, local_rank, rank, world_size
 logger = logging.getLogger(__name__)
 
 # writer = SummaryWriter()

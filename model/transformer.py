@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from codegan.beam import Beam
+from beam import Beam
 import tokenizer
 
 

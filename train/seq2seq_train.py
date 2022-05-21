@@ -16,12 +16,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AdamW, get_linear_schedule_with_warmup
 
-from codegan.baseline.seq2seq import Seq2Seq
+from model.seq2seq import Seq2Seq
 
-from .utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
-from ..utils import occupy_mem, set_seed
-from ..utils.meter import MaxMeter, BatchAvgMeter, MinMeter
-from ..utils.dist import is_distributed, local_rank, rank, world_size
+from utils.train_utils import Trainer, add_general_arguments, evaluate_metrics, eval_gen_loss, init_run_dir, is_notebook, save_model, setup_gpu, setup_logging
+from utils import occupy_mem, set_seed
+from utils.meter import MaxMeter, BatchAvgMeter, MinMeter
+from utils.dist import is_distributed, local_rank, rank, world_size
 
 logger = logging.getLogger(__name__)
 
@@ -170,9 +170,7 @@ if __name__ == '__main__':
     Seq2SeqTrainer.add_arguments(parser)
     Trainer.add_arguments(parser)
 
-    TRAIN_ARGS = '''--help'''.split()
-
-    args = parser.parse_args(TRAIN_ARGS if is_notebook() else sys.argv[1:])
+    args = parser.parse_args(sys.argv[1:])
 
     run_dir = init_run_dir("seq2seq_attn" if args.with_attention else "seq2seq")
     setup_logging(run_dir)

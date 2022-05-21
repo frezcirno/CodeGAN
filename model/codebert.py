@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from codegan.beam import Beam
+from beam import Beam
 from .roberta import RobertaModel
 from .decoder import TransformerDecoder
 import tokenizer
